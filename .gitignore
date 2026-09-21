@@ -1,0 +1,43 @@
+# .gitignore
+__pycache__/
+openface_output/
+*.csv
+*.txt
+*.hog
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Dependencias y compilaciones locales
+/deps/
+/build/
+/dist/
+CMakeFiles/
+CMakeCache.txt
+
+# Salidas de procesamiento
+openface_output/
+*.log
+
+# Modelos descargados: conservar documentación y scripts
+/openface-gestures/models/*
+!/openface-gestures/models/README.md
+!/openface-gestures/models/download_models.py
+!/openface-gestures/models/download_models.sh
+
+# Configuración privada
+.env
+.env.*
+!.env.example
+
+# Editor y sistema
+.idea/
+.vscode/
+.DS_Store
+*~
