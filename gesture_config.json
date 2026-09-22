@@ -11,7 +11,7 @@
       "mode_hold": 1.2,
       "center_hold": 0.3,
       "calibration": 2.0,
-      "brow": 0.7,
+      "brow": 0.9,
       "blink": 1.8,
       "mouth_open": 0.35,
       "mouth_close": 0.2,

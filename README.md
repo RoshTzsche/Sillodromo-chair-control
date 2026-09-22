@@ -2,8 +2,6 @@
 
 Interfaz de control manual y facial para el proyecto Sillódromo. MOVA transforma entradas de teclado, mouse o gestos en una intención de dirección y la envía por USB serial a un Arduino. Incluye calibración facial, ajustes persistentes y detección de apertura de boca.
 
-Este documento describe el código de `main` revisado en el commit **`b6c1e07`**. Los valores del archivo JSON pueden cambiar conforme cada usuario calibra el sistema.
-
 > La salida del programa representa una orden solicitada. El software no recibe confirmación de movimiento o parada de la silla. El protocolo actual supone dos bytes y neutro `(128, 128)`; esto debe corresponder al firmware y al controlador realmente conectados.
 
 ## Contenido
