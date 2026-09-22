@@ -4,7 +4,8 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import ttk, messagebox
+from gestures.config import defaults, load_config, save_config, validate
 from arduino_output import ArduinoOutput
 
 BG, INK, MUTED, LILA, MENTA = '#FDF1F4', '#4A4E69', '#81717D', '#E2D4F0', '#B5E4CA'
@@ -42,6 +43,7 @@ class Camera(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.commands = queue.Queue()
+        self.events = queue.Queue()
         self.lock = threading.Lock()
         self.snapshot = None
         self.quit = threading.Event()
@@ -71,15 +73,16 @@ class Camera(threading.Thread):
             cap = m.open_camera(0)
             if not cap.isOpened():
                 raise RuntimeError('No se pudo abrir la cámara. Revisa los permisos de macOS.')
-            generation, invert_x, invert_y = 0, False, False
-            controller = m.GestureController(a, emit=lambda event: None)
+            generation = 0
+            controller = m.GestureController(a, emit=lambda event: self.events.put((generation, event)) if event["type"] == "MOUTH_OPEN" else None)
             start, stamp = time.monotonic(), -1
             while not self.quit.is_set():
                 try:
                     while True:
-                        generation, invert_x, invert_y = self.commands.get_nowait()
-                        a.invert_x, a.invert_y = invert_x, invert_y
-                        controller = m.GestureController(a, emit=lambda event: None)
+                        generation, settings = self.commands.get_nowait()
+                        for key, value in validate(settings).items():
+                            setattr(a, key, value)
+                        controller = m.GestureController(a, emit=lambda event: self.events.put((generation, event)) if event["type"] == "MOUTH_OPEN" else None)
                 except queue.Empty:
                     pass
                 ok, frame = cap.read()
@@ -109,11 +112,11 @@ class Camera(threading.Thread):
                     else:
                         x, y = pose
                         brow, blink = m.brow_metric(face, w, h), m.blink_metric(face, w, h)
-                        controller.feed(x, y, brow, blink, True, now)
+                        controller.feed(x, y, brow, blink, True, now, mouth=m.mouth_metric(face, w, h))
                         if controller.baseline is not None:
                             bx, by, bb = controller.baseline
-                            dx = (x - bx) * (-1 if invert_x else 1)
-                            dy = (y - by) * (-1 if invert_y else 1)
+                            dx = (x - bx) * (-1 if a.invert_x else 1)
+                            dy = (y - by) * (-1 if a.invert_y else 1)
                             db = brow - bb
                     m.draw_landmarks(frame, face, w, h)
                 else:
@@ -123,13 +126,15 @@ class Camera(threading.Thread):
                     status = {'rostro_no_detectado': 'Rostro no detectado', 'ojos_cerrados': 'Ojos cerrados: vuelve al centro'}.get(controller.last_fault, 'Seguimiento no confiable')
                 elif controller.baseline is None:
                     status = 'Calibrando: mira al centro con cejas relajadas'
+                elif controller.candidate == 'BOCA':
+                    status = 'Sostén la apertura' if controller.mouth_ready else 'Boca registrada o bloqueada: ciérrala para rearmar'
                 elif controller.active:
                     status = 'Gesto confirmado: ' + controller.active.lower()
                 elif controller.armed:
-                    status = 'Listo: sostén una dirección o levanta las cejas'
+                    status = 'Listo: dirección, cejas o apertura de boca'
                 else:
                     status = 'Vuelve al centro para habilitar el siguiente gesto'
-                required = a.center_hold if controller.candidate == 'CENTRO' else a.mode_hold if controller.candidate == 'MODO' else a.hold
+                required = a.mouth_hold if controller.candidate == 'BOCA' else a.center_hold if controller.candidate == 'CENTRO' else a.mode_hold if controller.candidate == 'MODO' else a.hold
                 progress = min(100, max(0, (now - controller.since) / required * 100)) if controller.candidate not in (None, 'AMBIGUO') else 0
                 m.draw_hud(frame, controller, a, dx, dy, db, blink, now, w, h)
                 self.publish(dict(status=status, generation=generation, at=now, direction=controller.active,
@@ -153,6 +158,14 @@ class Panel:
         self.timers, self.held, self.blocked = {}, set(), set()
         self.mouse = None
         self.last_image = None
+        self.settings_window = None
+        self.mouth_count = 0
+        config_error = None
+        try:
+            self.settings = load_config()
+        except (OSError, ValueError) as exc:
+            self.settings = defaults()
+            config_error = str(exc)
         root.title('MOVA | Manual y gestos · Arduino')
         root.geometry('1080x840')
         root.minsize(960, 780)
@@ -179,6 +192,7 @@ class Panel:
             tk.Radiobutton(controls, text=source, value=source, variable=self.source, command=self.change_source, bg=BG, fg=INK).pack(side='left', padx=8)
         self.button(controls, 'Iniciar cámara', self.start_camera).pack(side='right', padx=6)
         self.button(controls, 'Calibrar', self.calibrate).pack(side='right', padx=6)
+        self.button(controls, 'Ajustes de gestos', self.open_settings).pack(side='right', padx=6)
         body = tk.Frame(root, bg=BG)
         body.pack(fill='both', expand=True, padx=24)
         body.columnconfigure(0, weight=3)
@@ -193,7 +207,8 @@ class Panel:
         self.camera_status.pack(fill='x', pady=8)
         self.progress = ttk.Progressbar(left, maximum=100)
         self.progress.pack(fill='x')
-        self.invert_x, self.invert_y = tk.BooleanVar(), tk.BooleanVar()
+        self.invert_x = tk.BooleanVar(value=self.settings['invert_x'])
+        self.invert_y = tk.BooleanVar(value=self.settings['invert_y'])
         for title, var in [('Invertir izquierda / derecha', self.invert_x), ('Invertir adelante / atrás', self.invert_y)]:
             tk.Checkbutton(left, text=title, variable=var, command=self.calibrate, bg='white', fg=INK).pack(anchor='w')
         right = tk.Frame(body, bg='white', padx=20, pady=16)
@@ -203,6 +218,8 @@ class Panel:
         self.order.pack(pady=12)
         self.mode = self.label(right, 'Control manual', 12, bg='white')
         self.mode.pack()
+        self.mouth_status = self.label(right, 'Boca: sin eventos · acción pendiente', 10, bg='white')
+        self.mouth_status.pack()
         pad = tk.Frame(right, bg='white')
         pad.pack(pady=18)
         self.buttons = {}
@@ -232,6 +249,77 @@ class Panel:
         root.bind('<FocusOut>', lambda e: root.after_idle(self.check_focus))
         root.protocol('WM_DELETE_WINDOW', self.close)
         self.refresh()
+        if config_error:
+            root.after_idle(lambda: messagebox.showerror('Configuración no cargada',
+                config_error + '\nSe usan los valores predeterminados; el archivo no fue reemplazado.'))
+
+    def open_settings(self):
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            return
+        self.stop()
+        win = self.settings_window = tk.Toplevel(self.root)
+        win.title('Ajustes de gestos · MediaPipe')
+        win.transient(self.root)
+        win.grab_set()  # El teclado de ajustes no controla el movimiento.
+        box = ttk.Frame(win, padding=16)
+        box.pack(fill='both', expand=True)
+        ttk.Label(box, text='Menor umbral = más sensibilidad. Tab cambia de campo; flechas ajustan.').grid(
+            row=0, column=0, columnspan=4, sticky='w', pady=(0, 12))
+        fields = [
+            ('threshold_x', 'Horizontal (rad)', .01), ('threshold_y', 'Vertical (rad)', .01),
+            ('release', 'Zona central (rad)', .01), ('diagonal_ratio', 'Dominancia inicial (menor = más ancho)', .05),
+            ('sustain_ratio', 'Dominancia sostenida (menor = más tolerancia)', .05),
+            ('hold', 'Confirmar dirección (s)', .05), ('center_hold', 'Confirmar centro (s)', .05),
+            ('brow', 'Umbral de cejas', .05), ('mode_hold', 'Confirmar cejas (s)', .1),
+            ('blink', 'Umbral de ojos cerrados', .1), ('calibration', 'Calibración (s)', .5),
+            ('mouth_open', 'Boca: apertura / ancho', .01), ('mouth_close', 'Boca: cierre / ancho', .01),
+            ('mouth_hold', 'Confirmar apertura (s)', .05), ('mouth_close_hold', 'Confirmar cierre (s)', .05),
+        ]
+        variables = {}
+        for row, (key, label, step) in enumerate(fields, 1):
+            ttk.Label(box, text=label).grid(row=row, column=0, sticky='w', padx=(0, 15), pady=3)
+            var = variables[key] = tk.StringVar(value=str(self.settings[key]))
+            ttk.Spinbox(box, textvariable=var, from_=step, to=100, increment=step, width=12).grid(
+                row=row, column=1, sticky='ew')
+        row = len(fields) + 1
+        for key, label in [('invert_x', 'Invertir horizontal'), ('invert_y', 'Invertir vertical')]:
+            var = variables[key] = tk.BooleanVar(value=getattr(self, key).get())
+            ttk.Checkbutton(box, text=label, variable=var).grid(row=row, column=0, columnspan=2, sticky='w')
+            row += 1
+        feedback = ttk.Label(box, text='Aplicar pausa el control y vuelve a calibrar.')
+        feedback.grid(row=row, column=0, columnspan=2, pady=8)
+
+        def apply(persist=False):
+            try:
+                values = validate({key: var.get() if key.startswith('invert_') else float(var.get())
+                                   for key, var in variables.items()})
+                if persist:
+                    save_config(values)
+                self.settings = values
+                self.invert_x.set(values['invert_x'])
+                self.invert_y.set(values['invert_y'])
+                self.stop()
+                self.reset_camera()
+                feedback.configure(text='Guardado y aplicado.' if persist else 'Aplicado; aún no guardado.')
+            except (ValueError, OSError, tk.TclError) as exc:
+                messagebox.showerror('Ajustes inválidos', str(exc), parent=win)
+
+        def reload_values():
+            try:
+                values = load_config()
+                for key, var in variables.items():
+                    var.set(values[key])
+                feedback.configure(text='Archivo cargado en los campos; pulsa Aplicar.')
+            except (ValueError, OSError) as exc:
+                messagebox.showerror('No se pudo cargar', str(exc), parent=win)
+
+        buttons = ttk.Frame(box)
+        buttons.grid(row=row+1, column=0, columnspan=2, pady=8)
+        for label, command in [('Aplicar', apply), ('Aplicar y guardar', lambda: apply(True)),
+                               ('Recargar archivo', reload_values), ('Cerrar', win.destroy)]:
+            ttk.Button(buttons, text=label, command=command).pack(side='left', padx=3)
+        win.bind('<Escape>', lambda event: win.destroy())
 
     def label(self, parent, text, size, bg=BG):
         return tk.Label(parent, text=text, font=('Arial', size), bg=bg, fg=INK)
@@ -279,7 +367,8 @@ class Panel:
     def reset_camera(self):
         self.generation += 1
         if self.worker:
-            self.worker.commands.put((self.generation, self.invert_x.get(), self.invert_y.get()))
+            self.settings.update(invert_x=self.invert_x.get(), invert_y=self.invert_y.get())
+            self.worker.commands.put((self.generation, self.settings.copy()))
 
     def calibrate(self):
         self.stop()
@@ -287,6 +376,10 @@ class Panel:
         self.reset_camera()
 
     def key_down(self, event):
+        if isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox)):
+            if event.keysym.lower() == 'escape':
+                self.stop()
+            return
         key = event.keysym.lower()
         if key == 'escape':
             self.stop()
@@ -336,6 +429,15 @@ class Panel:
             self.usb_status.configure(text=status + suffix)
             if self.intent.enabled and (not ready or not enabled):
                 self.stop()
+        if self.worker:
+            try:
+                while True:
+                    generation, event = self.worker.events.get_nowait()
+                    if generation == self.generation and now - event['monotonic'] <= .5:
+                        self.mouth_count += 1
+                        self.mouth_status.configure(text=f'Boca: {self.mouth_count} apertura(s) · acción pendiente')
+            except queue.Empty:
+                pass
         data = self.worker.read() if self.worker else None
         if data:
             self.camera_status.configure(text=data['status'])

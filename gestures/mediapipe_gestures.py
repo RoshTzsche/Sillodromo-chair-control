@@ -6,7 +6,7 @@ Ejemplo:
   python mediapipe_gestures.py --preview --debug --invert-x
 
 stdout: mismos eventos JSONL que openface.py (STOP/MOVE/INTERACT/MODE/
-HEARTBEAT/CALIBRATED); stderr: estado y diagnóstico. Ctrl+C o ESC terminan.
+
 Documentación:
 https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker
 """
@@ -47,6 +47,12 @@ else:
     _locate_openface()
 
 from openface import GestureController, log  # noqa: E402  (misma máquina de estados)
+
+
+try:
+    from .config import add_config_arguments, parse_settings
+except ImportError:
+    from config import add_config_arguments, parse_settings
 
 
 FACE_MODEL_URL = (
@@ -131,6 +137,14 @@ def blink_metric(landmarks, w, h):
     return max(0.0, EAR_OPEN_BASELINE - avg_ear) * BLINK_SCALE
 
 
+def mouth_metric(landmarks, w, h):
+    """Apertura interior (13–14) / ancho de boca (61–291), sin unidades."""
+    def point(i):
+        return (landmarks[i].x * w, landmarks[i].y * h)
+    width = euclid(point(61), point(291))
+    return euclid(point(13), point(14)) / width if width > 0 else float('nan')
+
+
 def brow_metric(landmarks, w, h):
     interocular = euclid(
         (landmarks[LEFT_EYE_OUTER].x * w, landmarks[LEFT_EYE_OUTER].y * h),
@@ -165,7 +179,7 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 def draw_landmarks(image, landmarks, w, h):
-    for i in POSE_LANDMARKS + LEFT_EYE_EAR + RIGHT_EYE_EAR + [LEFT_BROW, RIGHT_BROW, LEFT_EYE_TOP, RIGHT_EYE_TOP]:
+    for i in POSE_LANDMARKS + LEFT_EYE_EAR + RIGHT_EYE_EAR + [LEFT_BROW, RIGHT_BROW, LEFT_EYE_TOP, RIGHT_EYE_TOP, 13, 14]:
         cx, cy = int(landmarks[i].x * w), int(landmarks[i].y * h)
         cv2.circle(image, (cx, cy), 2, (255, 255, 0), -1)
 
@@ -205,9 +219,9 @@ def _draw_hold_bar(image, controller, a, now, w, h):
         required, label = a.center_hold, 'CENTRO (armando)'
         locked = False
     else:
-        required = a.mode_hold if candidate == 'MODO' else a.hold
+        required = a.mouth_hold if candidate == 'BOCA' else a.mode_hold if candidate == 'MODO' else a.hold
         label = candidate
-        locked = not controller.armed
+        locked = not controller.mouth_ready if candidate == 'BOCA' else not controller.armed
     elapsed = max(0.0, now - controller.since)
     frac = max(0.0, min(1.0, elapsed / required))
     bar_w, bar_h = 220, 16
@@ -215,7 +229,7 @@ def _draw_hold_bar(image, controller, a, now, w, h):
     cv2.rectangle(image, (x0, y0), (x0 + bar_w, y0 + bar_h), (70, 70, 70), 1)
     color = (120, 120, 120) if locked else (0, 200, 255)
     cv2.rectangle(image, (x0, y0), (x0 + int(bar_w * frac), y0 + bar_h), color, -1)
-    text = f'{label} — requiere volver al CENTRO' if locked else label
+    text = (f'{label}: cierra la boca' if candidate == 'BOCA' else f'{label}: vuelve al CENTRO') if locked else label
     cv2.putText(image, text, (x0, y0 - 6), FONT, 0.45, (255, 255, 255), 1)
 
 
@@ -223,12 +237,17 @@ def draw_hud(image, controller, a, disp_x, disp_y, disp_brow, blink_raw, now, w,
     """Overlay directo sobre el frame: marcador central, punto de gesto,
     zonas de umbral, medidores de cejas/parpadeo y barra de sostenimiento."""
     cx, cy = w // 2, h // 2
-    scale = min(w, h) * 0.45 / (a.threshold * 2.5)
+    scale = min(w, h) * 0.45 / (.22 * 2.5)  # escala visual fija
     r_release = int(a.release * scale)
-    r_threshold = int(a.threshold * scale)
+    rx = int(a.threshold_x * scale)
+    ry = int(a.threshold_y * scale)
+    r_threshold = max(rx, ry)
 
-    cv2.circle(image, (cx, cy), r_release, (90, 90, 90), 1)
-    cv2.circle(image, (cx, cy), r_threshold, (60, 60, 60), 1)
+    cv2.rectangle(image, (cx-r_release, cy-r_release), (cx+r_release, cy+r_release), (90, 90, 90), 1)
+    cv2.line(image, (cx+rx, cy-ry), (cx+rx, cy+ry), (100, 100, 100), 1)
+    cv2.line(image, (cx-rx, cy-ry), (cx-rx, cy+ry), (100, 100, 100), 1)
+    cv2.line(image, (cx-rx, cy-ry), (cx+rx, cy-ry), (100, 100, 100), 1)
+    cv2.line(image, (cx-rx, cy+ry), (cx+rx, cy+ry), (100, 100, 100), 1)
     cv2.drawMarker(image, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 16, 1)
 
     labels = {
@@ -252,6 +271,7 @@ def draw_hud(image, controller, a, disp_x, disp_y, disp_brow, blink_raw, now, w,
 
     _draw_gauge(image, 10, h - 55, 150, 'CEJAS', disp_brow, a.brow, a.brow * 2)
     _draw_gauge(image, 10, h - 25, 150, 'OJOS', blink_raw, a.blink, a.blink * 2)
+    _draw_gauge(image, 10, h - 85, 150, 'BOCA', controller.mouth_raw, a.mouth_open, a.mouth_open * 2)
     _draw_hold_bar(image, controller, a, now, w, h)
 
     status = f'modo={controller.mode}  activo={controller.active}  candidato={controller.candidate}'
@@ -266,8 +286,8 @@ def parser():
     p.add_argument('--min-tracking-confidence', type=float, default=.5)
     p.add_argument('--preview', action='store_true')
     p.add_argument('--debug', action='store_true')
-    p.add_argument('--invert-x', action='store_true')
-    p.add_argument('--invert-y', action='store_true')
+    p.add_argument('--invert-x', action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument('--invert-y', action=argparse.BooleanOptionalAction, default=False)
     p.add_argument('--threshold', type=float, default=.22, help='umbral direccional, radianes')
     p.add_argument('--release', type=float, default=.12, help='zona central, radianes')
     p.add_argument('--brow', type=float, default=.9, help='umbral cejas, escala heurística propia')
@@ -278,18 +298,17 @@ def parser():
     p.add_argument('--calibration', type=float, default=2.0)
     p.add_argument('--stale', type=float, default=.5, help='timeout de datos, segundos')
     p.add_argument('--startup-timeout', type=float, default=15)
+    add_config_arguments(p, 'mediapipe')
     return p
 
 
 def main():
     p = parser()
-    a = p.parse_args()
+    a = parse_settings(p, 'mediapipe')
     positives = ('threshold', 'release', 'brow', 'blink', 'hold', 'mode_hold',
                  'center_hold', 'calibration', 'stale', 'startup_timeout')
     if any(not math.isfinite(getattr(a, k)) or getattr(a, k) <= 0 for k in positives):
         p.error('Los umbrales y tiempos deben ser positivos y finitos.')
-    if a.release >= a.threshold:
-        p.error('Requiere release < threshold.')
 
     model_path = a.models_dir.expanduser().resolve() / 'face_landmarker.task'
     ensure_model(model_path)
@@ -310,6 +329,8 @@ def main():
     cap = open_camera(a.device)
     if not cap.isOpened():
         log('[Critical Error] No se pudo abrir la cámara.')
+        cap.release()
+        face_landmarker.close()
         return 1
 
     controller.event('STOP', reason='inicio')
@@ -317,12 +338,13 @@ def main():
 
     start_mono = time.monotonic()
     last_ts_ms = -1
-    last_seen = None
 
     try:
         while True:
             success, frame = cap.read()
             if not success:
+                controller.fault('lectura_camara')
+                time.sleep(.02)
                 continue
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
@@ -339,7 +361,6 @@ def main():
 
             if result.face_landmarks:
                 landmarks = result.face_landmarks[0]
-                last_seen = now
                 pose = head_pose(landmarks, w, h)
                 if pose is None:
                     controller.fault('rostro_no_confiable')
@@ -348,7 +369,7 @@ def main():
                     yaw, pitch = pose
                     brow = brow_metric(landmarks, w, h)
                     blink = blink_metric(landmarks, w, h)
-                    controller.feed(yaw, pitch, brow, blink, True, now)
+                    controller.feed(yaw, pitch, brow, blink, True, now, mouth=mouth_metric(landmarks, w, h))
                 if a.preview:
                     draw_landmarks(frame, landmarks, w, h)
                     if controller.baseline is not None and yaw is not None:
@@ -360,9 +381,7 @@ def main():
                         disp_x = disp_y = disp_brow = None
                     draw_hud(frame, controller, a, disp_x, disp_y, disp_brow, blink, now, w, h)
             else:
-                controller.tick(now)
-                if last_seen is not None and now - last_seen > a.stale:
-                    controller.fault('sin_datos_recientes')
+                controller.fault('rostro_no_detectado')
 
             if a.preview:
                 cv2.imshow('mediapipe_gestures', frame)
@@ -373,6 +392,7 @@ def main():
     finally:
         controller.stop('cierre', force=True)
         cap.release()
+        face_landmarker.close()
         if a.preview:
             cv2.destroyAllWindows()
     return 0
