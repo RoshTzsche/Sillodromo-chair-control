@@ -17,44 +17,172 @@
       "mouth_close": 0.2,
       "mouth_hold": 0.45,
       "mouth_close_hold": 0.2,
-      "invert_x": true,
+      "invert_x": false,
       "invert_y": false,
       "menu_hold": 3.0,
       "interact_page_hold": 1.2,
       "cam_front_index": 0,
-      "cam_rear_index": 1,
-      "alexa_commands": [
-        {
-          "id": "on_1",
-          "phrase": "Alexa, enciende enchufe uno",
-          "icon": "switch.png"
-        },
-        {
-          "id": "on_2",
-          "phrase": "Alexa, enciende enchufe dos",
-          "icon": "switch.png"
-        },
-        {
-          "id": "on_3",
-          "phrase": "Alexa, enciende enchufe tres",
-          "icon": "switch.png"
-        },
-        {
-          "id": "off_1",
-          "phrase": "Alexa, apaga enchufe uno",
-          "icon": "switch.png"
-        },
-        {
-          "id": "off_2",
-          "phrase": "Alexa, apaga enchufe dos",
-          "icon": "switch.png"
-        },
-        {
-          "id": "off_3",
-          "phrase": "Alexa, apaga enchufe tres",
-          "icon": "switch.png"
-        }
-      ]
+      "cam_rear_index": 0,
+"alexa_commands": [
+  {
+    "id": "focoon",
+    "phrase": "Alexa, enciende el foco",
+    "icon": "switch.png",
+    "audio": "audio/Enciende foco.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "focooff",
+    "phrase": "Alexa, apaga el foco",
+    "icon": "switch.png",
+    "audio": "audio/Apaga Foco.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "on_1",
+    "phrase": "Alexa, enciende Cafetera",
+    "icon": "switch.png",
+    "audio": "audio/Cafetera on.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "on_2",
+    "phrase": "Alexa, apaga Cafetera",
+    "icon": "switch.png",
+    "audio": "audio/Cafetera off.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "on_3",
+    "phrase": "Alexa, enciende Rasuradora",
+    "icon": "switch.png",
+    "audio": "audio/Rasu on.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "off_1",
+    "phrase": "Alexa, apaga Rasuradora",
+    "icon": "switch.png",
+    "audio": "audio/Rasu off.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "off_2",
+    "phrase": "Alexa, enciende Secadora",
+    "icon": "switch.png",
+    "audio": "audio/Secadora on.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "off_3",
+    "phrase": "Alexa, apaga Secadora",
+    "icon": "switch.png",
+    "audio": "audio/Secadora off.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "ventilador_on",
+    "phrase": "Alexa, enciende Ventilador",
+    "icon": "switch.png",
+    "audio": "audio/Venti on.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "ventilador_off",
+    "phrase": "Alexa, apaga Ventilador",
+    "icon": "switch.png",
+    "audio": "audio/Ventilador off.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "tv_netflix",
+    "phrase": "Alexa, abre Netflix",
+    "icon": "netflix.png",
+    "audio": "audio/Netflix.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "tv_youtube",
+    "phrase": "Alexa, abre YouTube",
+    "icon": "youtube.png",
+    "audio": "audio/Youtube.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "tv_prime",
+    "phrase": "Alexa, abre Prime Video",
+    "icon": "prime.png",
+    "audio": "audio/Prime.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "amazon_music",
+    "phrase": "Alexa, abre Amazon Music",
+    "icon": "music.png",
+    "audio": "audio/Amazonmusic.m4a.mp4",
+    "wake_audio": "audio/Alexa.m4a.mp4",
+    "pause_after_wake": 0.5,
+    "pause_after": 1.0
+  },
+  {
+    "id": "presentacion_lulu",
+    "phrase": "Hola, soy Lulu",
+    "icon": "speaker.png",
+    "audio": "audio/Hola soy lulu.m4a.mp4",
+    "wake_audio": "",
+    "pause_after": 1.0
+  },
+  {
+    "id": "agradecimiento",
+    "phrase": "Muchas gracias",
+    "icon": "speaker.png",
+    "audio": "audio/Muchas gracias.m4a.mp4",
+    "wake_audio": "",
+    "pause_after": 1.0
+  },
+  {
+    "id": "saludo",
+    "phrase": "Un gusto",
+    "icon": "speaker.png",
+    "audio": "audio/Un gusto.m4a.mp4",
+    "wake_audio": "",
+    "pause_after": 1.0
+  },
+   {
+    "id": "feliz",
+    "phrase": "Feliz por moverme y tener voz",
+    "icon": "speaker.png",
+    "audio": "audio/felizpormoverme.mp4",
+    "wake_audio": "",
+    "pause_after": 1.0
+  }
+]
     }
   }
 }

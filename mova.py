@@ -5,7 +5,7 @@ import textwrap
 import threading
 import time
 from pathlib import Path
-
+from gestures.config import load_config
 import cv2
 import numpy as np
 import tkinter as tk
@@ -409,7 +409,27 @@ class Panel:
 
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
+    def reload_alexa(self):
+        try:
+            loaded = load_config(path=self.args.config)
+            self.alexa.reload(loaded)
 
+            commands = copy.deepcopy(loaded["alexa_commands"])
+            self.config["alexa_commands"] = commands
+            self.args.alexa_commands = copy.deepcopy(commands)
+
+            self.page_index %= self.alexa.page_count
+            self.message = (
+                f"Alexa: {len(commands)} comandos · "
+                f"{self.alexa.page_count} páginas"
+            )
+
+        except (ValueError, OSError) as exc:
+            messagebox.showerror(
+                "Recargar Alexa",
+                str(exc),
+                parent=self.root,
+            )
     def _start_workers(self):
         for key, value in self.config.items():
             setattr(self.args, key, copy.deepcopy(value))
@@ -622,7 +642,7 @@ class Panel:
                     ("ADELANTE" in selected) - ("ATRAS" in selected)
                 )
                 horizontal = 128 + 120 * (
-                    ("DERECHA" in selected) - ("IZQUIERDA" in selected)
+                    ("IZQUIERDA" in selected) - ("DERECHA" in selected)
                 )
                 self.arduino_output.send_move(
                     vertical, horizontal, deadline
@@ -855,11 +875,17 @@ class Panel:
 
     def _apply_config(self, values):
         if self.restarting:
-            raise ValueError("Las cámaras todavía se están reiniciando.")
+            raise ValueError(
+                "Las cámaras todavía se están reiniciando."
+            )
 
         values = validate(values)
         save_config(values, path=self.args.config)
+
         self.config = values
+        self.alexa.reload(values)
+        self.page_index %= self.alexa.page_count
+
         self.message = "Configuración guardada"
         self._restart_workers()
 
