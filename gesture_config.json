@@ -18,7 +18,43 @@
       "mouth_hold": 0.45,
       "mouth_close_hold": 0.2,
       "invert_x": false,
-      "invert_y": false
+      "invert_y": false,
+      "menu_hold": 3.0,
+      "interact_page_hold": 1.2,
+      "cam_front_index": 0,
+      "cam_rear_index": 0,
+      "alexa_commands": [
+        {
+          "id": "on_1",
+          "phrase": "Alexa, enciende enchufe uno",
+          "icon": "switch.png"
+        },
+        {
+          "id": "on_2",
+          "phrase": "Alexa, enciende enchufe dos",
+          "icon": "switch.png"
+        },
+        {
+          "id": "on_3",
+          "phrase": "Alexa, enciende enchufe tres",
+          "icon": "switch.png"
+        },
+        {
+          "id": "off_1",
+          "phrase": "Alexa, apaga enchufe uno",
+          "icon": "switch.png"
+        },
+        {
+          "id": "off_2",
+          "phrase": "Alexa, apaga enchufe dos",
+          "icon": "switch.png"
+        },
+        {
+          "id": "off_3",
+          "phrase": "Alexa, apaga enchufe tres",
+          "icon": "switch.png"
+        }
+      ]
     }
   }
 }

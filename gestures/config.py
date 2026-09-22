@@ -5,44 +5,195 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import copy
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / 'gesture_config.json'
-DEFAULTS = dict(threshold_x=.22, threshold_y=.16, release=.12,
-                diagonal_ratio=1.0, sustain_ratio=.65,
-                hold=.45, mode_hold=1.2, center_hold=.3, calibration=2.0,
-                brow=.9, blink=1.8, mouth_open=.35, mouth_close=.20,
-                mouth_hold=.45, mouth_close_hold=.20,
-                invert_x=False, invert_y=False)
+
+DEFAULTS = dict(
+    threshold_x=.22,
+    threshold_y=.16,
+    release=.12,
+    diagonal_ratio=1.0,
+    sustain_ratio=.65,
+    hold=.45,
+    mode_hold=1.2,
+    center_hold=.3,
+    calibration=2.0,
+    brow=.9,
+    blink=1.8,
+    mouth_open=.35,
+    mouth_close=.20,
+    mouth_hold=.45,
+    mouth_close_hold=.20,
+    invert_x=False,
+    invert_y=False,
+
+    menu_hold=3.0,
+    interact_page_hold=1.2,
+    cam_front_index=2,
+    cam_rear_index=1,
+    alexa_commands=[
+        {
+            "id": "on_1",
+            "phrase": "Alexa, enciende enchufe uno",
+            "icon": "switch.png",
+        },
+        {
+            "id": "on_2",
+            "phrase": "Alexa, enciende enchufe dos",
+            "icon": "switch.png",
+        },
+        {
+            "id": "on_3",
+            "phrase": "Alexa, enciende enchufe tres",
+            "icon": "switch.png",
+        },
+        {
+            "id": "off_1",
+            "phrase": "Alexa, apaga enchufe uno",
+            "icon": "switch.png",
+        },
+        {
+            "id": "off_2",
+            "phrase": "Alexa, apaga enchufe dos",
+            "icon": "switch.png",
+        },
+        {
+            "id": "off_3",
+            "phrase": "Alexa, apaga enchufe tres",
+            "icon": "switch.png",
+        },
+    ],
+)
 
 
-def defaults(backend='mediapipe'):
-    result = DEFAULTS.copy()
-    if backend == 'openface':
-        result.update(brow=1.5, blink=2.5, mouth_open=2.0, mouth_close=1.0)
+def defaults(backend="mediapipe"):
+    result = copy.deepcopy(DEFAULTS)
+    if backend == "openface":
+        result.update(
+            brow=1.5,
+            blink=2.5,
+            mouth_open=2.0,
+            mouth_close=1.0,
+        )
     return result
 
 
-def validate(values, backend='mediapipe'):
+def validate(values, backend="mediapipe"):
     if not isinstance(values, dict):
-        raise ValueError('La configuración debe ser un objeto JSON.')
+        raise ValueError("La configuración debe ser un objeto JSON.")
+
     unknown = values.keys() - DEFAULTS.keys()
     if unknown:
-        raise ValueError('Parámetros desconocidos: ' + ', '.join(sorted(unknown)))
+        raise ValueError(
+            "Parámetros desconocidos: " + ", ".join(sorted(unknown))
+        )
+
     result = defaults(backend)
-    result.update(values)
+    result.update(copy.deepcopy(values))
+
     for key, value in result.items():
-        if key.startswith('invert_'):
+        if key == "alexa_commands":
+            if not isinstance(value, list):
+                raise ValueError("alexa_commands debe ser una lista.")
+
+            identifiers = set()
+            for command in value:
+                if not isinstance(command, dict):
+                    raise ValueError("Cada comando debe ser un objeto.")
+
+                for field in ("id", "phrase", "icon"):
+                    if not isinstance(command.get(field), str):
+                        raise ValueError(
+                            f"Cada comando requiere '{field}' como texto."
+                        )
+
+                if not command["id"].strip() or not command["phrase"].strip():
+                    raise ValueError("id y phrase no pueden estar vacíos.")
+
+                if command["id"] in identifiers:
+                    raise ValueError(
+                        f"ID de Alexa repetido: {command['id']}"
+                    )
+                identifiers.add(command["id"])
+
+        elif key in ("cam_front_index", "cam_rear_index"):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{key} debe ser un entero >= 0.")
+
+        elif key.startswith("invert_"):
             if type(value) is not bool:
-                raise ValueError(f'{key} debe ser booleano.')
-        elif (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
-            raise ValueError(f'{key} debe ser positivo y finito.')
-    if result['release'] >= min(result['threshold_x'], result['threshold_y']):
-        raise ValueError('Centro debe ser menor que ambos umbrales direccionales.')
-    if result['mouth_close'] >= result['mouth_open']:
-        raise ValueError('Cierre de boca debe ser menor que apertura.')
-    if not 0 < result['sustain_ratio'] <= result['diagonal_ratio'] or result['diagonal_ratio'] < 1:
-        raise ValueError('Se requiere 0 < tolerancia sostenida ≤ dominancia inicial y dominancia inicial ≥ 1.')
+                raise ValueError(f"{key} debe ser booleano.")
+
+        elif (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{key} debe ser positivo y finito.")
+
+    if result["release"] >= min(
+        result["threshold_x"], result["threshold_y"]
+    ):
+        raise ValueError(
+            "Centro debe ser menor que ambos umbrales direccionales."
+        )
+
+    if result["mouth_close"] >= result["mouth_open"]:
+        raise ValueError(
+            "Cierre de boca debe ser menor que apertura."
+        )
+
+    if not (
+        0 < result["sustain_ratio"] <= result["diagonal_ratio"]
+        and result["diagonal_ratio"] >= 1
+    ):
+        raise ValueError(
+            "Se requiere 0 < sustain_ratio <= diagonal_ratio "
+            "y diagonal_ratio >= 1."
+        )
+
     return result
+
+
+def add_config_arguments(parser, backend):
+    existing = {action.dest for action in parser._actions}
+
+    if "config" not in existing:
+        parser.add_argument(
+            "--config", type=Path, default=CONFIG_PATH
+        )
+
+    # Flag de ejecución: no se persiste en el perfil.
+    if "manual" not in existing:
+        parser.add_argument(
+            "--manual",
+            action="store_true",
+            help="Mostrar y habilitar controles de teclado/ratón.",
+        )
+
+    for key, value in defaults(backend).items():
+        if key in existing:
+            continue
+
+        option = "--" + key.replace("_", "-")
+
+        if isinstance(value, bool):
+            parser.add_argument(
+                option,
+                action=argparse.BooleanOptionalAction,
+                default=value,
+            )
+        elif key == "alexa_commands":
+            parser.add_argument(
+                option,
+                type=json.loads,
+                default=copy.deepcopy(value),
+            )
+        elif key in ("cam_front_index", "cam_rear_index"):
+            parser.add_argument(option, type=int, default=value)
+        else:
+            parser.add_argument(option, type=float, default=value)
 
 
 def read_document(path):
@@ -84,13 +235,6 @@ def save_config(values, path=CONFIG_PATH, backend='mediapipe'):
         if name and os.path.exists(name):
             os.unlink(name)
 
-
-def add_config_arguments(parser, backend):
-    parser.add_argument('--config', type=Path, default=CONFIG_PATH)
-    existing = {action.dest for action in parser._actions}
-    for key, value in defaults(backend).items():
-        if key not in existing:
-            parser.add_argument('--' + key.replace('_', '-'), type=float, default=value)
 
 
 def parse_settings(parser, backend, argv=None):

@@ -1,629 +1,1292 @@
-"""MOVA: control manual y por gestos con salida Arduino de dos bytes."""
+import copy
+import math
 import queue
+import textwrap
 import threading
 import time
-import tkinter as tk
 from pathlib import Path
+
+import cv2
+import numpy as np
+import tkinter as tk
 from tkinter import ttk, messagebox
-from gestures.config import defaults, load_config, save_config, validate
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+
 from arduino_output import ArduinoOutput
-
-BG, INK, MUTED, LILA, MENTA = '#FDF1F4', '#4A4E69', '#81717D', '#E2D4F0', '#B5E4CA'
-KEYS = {'w': 'w', 'up': 'w', 's': 's', 'down': 's', 'a': 'a', 'left': 'a', 'd': 'd', 'right': 'd'}
-DIRECTIONS = {'ADELANTE': 'w', 'ATRAS': 's', 'IZQUIERDA': 'a', 'DERECHA': 'd'}
-
-
-class Intent:
-    """Estado independiente de Tk, cámara y hardware; parada enclavada."""
-    def __init__(self):
-        self.enabled = False
-        self.source = 'Manual'
-        self.inputs = set()
-        self.direction = None
-        self.last = 0.
-
-    def stop(self):
-        self.enabled = False
-        self.inputs.clear()
-        self.direction = None
-
-    def values(self, now):
-        if not self.enabled:
-            return 128, 128
-        if self.source == 'Gestos':
-            keys = {DIRECTIONS.get(self.direction)} if now - self.last <= .5 else set()
-        else:
-            keys = {KEYS.get(k, k) for k in self.inputs}
-        return (128 + 120 * (('w' in keys) - ('s' in keys)),
-                128 + 120 * (('d' in keys) - ('a' in keys)))
+from control_alexa import AlexaDispatcher
+from gestures import mediapipe_gestures as vision
+from gestures.config import (
+    DEFAULTS,
+    parse_settings,
+    save_config,
+    validate,
+)
+from gestures.gesture_controller import GestureController
 
 
-class Camera(threading.Thread):
-    """Solo publica el frame más reciente; jamás accede a widgets Tk."""
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.commands = queue.Queue()
-        self.events = queue.Queue()
-        self.lock = threading.Lock()
-        self.snapshot = None
+ROOT = Path(__file__).resolve().parent
+ASSETS = ROOT / "assets"
+
+# Orden de los cuatro sectores, en sentido horario.
+DIRECTIONS = ("ADELANTE", "DERECHA", "ATRAS", "IZQUIERDA")
+KEYS = {
+    "w": "ADELANTE", "up": "ADELANTE",
+    "d": "DERECHA", "right": "DERECHA",
+    "s": "ATRAS", "down": "ATRAS",
+    "a": "IZQUIERDA", "left": "IZQUIERDA",
+}
+
+# Colores BGR de OpenCV.
+DARK = (128, 145, 0)
+TEAL = (172, 181, 24)
+LIGHT = (222, 231, 166)
+WHITE = (255, 255, 255)
+INK = (65, 65, 35)
+
+
+class ArduinoAdapter:
+    """Adapta la API existente sin modificar arduino_output.py."""
+
+    def __init__(self, state_getter):
+        self.output = None
+        self.state_getter = state_getter
+
+    def connect(self, port):
+        if self.output is not None and self.output.is_alive():
+            raise RuntimeError("Desconecta el puerto actual primero.")
+
+        self.output = ArduinoOutput(port)
+        self.output.start()
+
+    def send_move(self, vertical, horizontal, deadline):
+        if self.state_getter() != "DRIVE" or self.output is None:
+            return
+
+        ready, enabled, _, _ = self.output.info()
+        if not ready:
+            return
+        if not enabled and not self.output.arm():
+            return
+
+        self.output.submit(vertical, horizontal, deadline)
+
+    def send_stop(self):
+        if self.output is not None:
+            self.output.stop()
+
+    def disconnect(self):
+        if self.output is not None:
+            self.output.close()
+
+    def status(self):
+        if self.output is None:
+            return "USB desconectado"
+        return self.output.info()[2]
+
+
+class VideoSource(threading.Thread):
+    """Un hilo por cámara; publica únicamente el frame más reciente."""
+
+    def __init__(self, index):
+        super().__init__(daemon=True, name=f"camera-{index}")
+        self.index = index
         self.quit = threading.Event()
-
-    def publish(self, data):
-        with self.lock:
-            self.snapshot = data
+        self.lock = threading.Lock()
+        self.latest = (0, 0.0, None)
+        self.error = ""
 
     def read(self):
         with self.lock:
-            return self.snapshot
-    def run(self):
-        cap = detector = None
-        try:
-            from gestures import mediapipe_gestures as m
-            a = m.parser().parse_args([])
-            a.models_dir = Path(__file__).resolve().parent / 'models'
-            self.publish({'status': 'Preparando modelo de cámara…'})
-            m.ensure_model(a.models_dir / 'face_landmarker.task')
-            detector = m.mp.tasks.vision.FaceLandmarker.create_from_options(
-                m.mp.tasks.vision.FaceLandmarkerOptions(
-                    base_options=m.mp.tasks.BaseOptions(model_asset_path=str(a.models_dir / 'face_landmarker.task')),
-                    running_mode=m.mp.tasks.vision.RunningMode.VIDEO, num_faces=1,
-                    min_face_detection_confidence=a.min_face_confidence,
-                    min_tracking_confidence=a.min_tracking_confidence))
-            cap = m.open_camera(0)
-            if not cap.isOpened():
-                raise RuntimeError('No se pudo abrir la cámara. Revisa los permisos de macOS.')
-            generation = 0
-            controller = m.GestureController(a, emit=lambda event: self.events.put((generation, event)) if event["type"] == "MOUTH_OPEN" else None)
-            # [smoothing] Filtro EMA compartido con mediapipe_gestures.
-            smoother = m.EMASmoother(a.smooth_alpha)
-            start, stamp = time.monotonic(), -1
-            while not self.quit.is_set():
-                try:
-                    while True:
-                        generation, settings = self.commands.get_nowait()
-                        for key, value in validate(settings).items():
-                            setattr(a, key, value)
-                        controller = m.GestureController(a, emit=lambda event: self.events.put((generation, event)) if event["type"] == "MOUTH_OPEN" else None)
-                        # [smoothing] Nueva generación: no arrastrar estado suavizado obsoleto.
-                        smoother.reset()
-                except queue.Empty:
-                    pass
-                ok, frame = cap.read()
-                now = time.monotonic()
-                if not ok:
-                    controller.fault('lectura_camara')
-                    # [smoothing]
-                    smoother.reset()
-                    self.publish({'status': 'No llegan imágenes de la cámara', 'generation': generation,
-                                  'at': now, 'direction': None})
-                    self.quit.wait(.05)
-                    continue
-                frame = m.cv2.flip(frame, 1)
-                h, w = frame.shape[:2]
-                if w > 640:
-                    frame = m.cv2.resize(frame, (640, round(h * 640 / w)))
-                h, w = frame.shape[:2]
-                rgb = m.cv2.cvtColor(frame, m.cv2.COLOR_BGR2RGB)
-                stamp = max(stamp + 1, int((now - start) * 1000))
-                result = detector.detect_for_video(m.mp.Image(image_format=m.mp.ImageFormat.SRGB, data=rgb), stamp)
-                dx = dy = db = blink = None
-                if result.face_landmarks:
-                    face = result.face_landmarks[0]
-                    pose = m.head_pose(face, w, h)
-                    if pose is None:
-                        controller.fault('rostro_no_confiable')
-                        # [smoothing]
-                        smoother.reset()
-                    else:
-                        # [smoothing] Suavizado EMA por señal, igual que en mediapipe_gestures.py.
-                        x = smoother.apply('x', pose[0])
-                        y = smoother.apply('y', pose[1])
-                        brow = smoother.apply('brow', m.brow_metric(face, w, h))
-                        blink = smoother.apply('blink', m.blink_metric(face, w, h))
-                        # La boca se lee cruda: es un evento discreto, no una señal continua.
-                        controller.feed(x, y, brow, blink, True, now, mouth=m.mouth_metric(face, w, h))
-                        if controller.baseline is not None:
-                            bx, by, bb = controller.baseline
-                            dx = (x - bx) * (-1 if a.invert_x else 1)
-                            dy = (y - by) * (-1 if a.invert_y else 1)
-                            db = brow - bb
-                    m.draw_landmarks(frame, face, w, h)
-                else:
-                    controller.fault('rostro_no_detectado')
-                    # [smoothing]
-                    smoother.reset()
-                if controller.last_fault:
-                    status = {'rostro_no_detectado': 'Rostro no detectado', 'ojos_cerrados': 'Ojos cerrados: vuelve al centro'}.get(controller.last_fault, 'Seguimiento no confiable')
-                elif controller.baseline is None:
-                    status = 'Calibrando: mira al centro con cejas relajadas'
-                elif controller.candidate == 'BOCA':
-                    status = 'Sostén la apertura' if controller.mouth_ready else 'Boca registrada o bloqueada: ciérrala para rearmar'
-                elif controller.active:
-                    status = 'Gesto confirmado: ' + controller.active.lower()
-                elif controller.armed:
-                    status = 'Listo: dirección, cejas o apertura de boca'
-                else:
-                    status = 'Vuelve al centro para habilitar el siguiente gesto'
-                required = a.mouth_hold if controller.candidate == 'BOCA' else a.center_hold if controller.candidate == 'CENTRO' else a.mode_hold if controller.candidate == 'MODO' else a.hold
-                progress = min(100, max(0, (now - controller.since) / required * 100)) if controller.candidate not in (None, 'AMBIGUO') else 0
-                m.draw_hud(frame, controller, a, dx, dy, db, blink, now, w, h)
-                self.publish(dict(status=status, generation=generation, at=now, direction=controller.active,
-                                  mode=controller.mode, progress=progress,
-                                  image=m.cv2.cvtColor(frame, m.cv2.COLOR_BGR2RGB)))
-        except Exception as exc:
-            self.publish({'status': f'Cámara: {type(exc).__name__}: {exc}', 'error': True})
-        finally:
-            if cap is not None:
-                cap.release()
-            if detector is not None:
-                detector.close()
-  
-        cap = detector = None
-        try:
-            from gestures import mediapipe_gestures as m
-            a = m.parser().parse_args([])
-            a.models_dir = Path(__file__).resolve().parent / 'models'
-            self.publish({'status': 'Preparando modelo de cámara…'})
-            m.ensure_model(a.models_dir / 'face_landmarker.task')
-            detector = m.mp.tasks.vision.FaceLandmarker.create_from_options(
-                m.mp.tasks.vision.FaceLandmarkerOptions(
-                    base_options=m.mp.tasks.BaseOptions(model_asset_path=str(a.models_dir / 'face_landmarker.task')),
-                    running_mode=m.mp.tasks.vision.RunningMode.VIDEO, num_faces=1,
-                    min_face_detection_confidence=a.min_face_confidence,
-                    min_tracking_confidence=a.min_tracking_confidence))
-            cap = m.open_camera(0)
-            if not cap.isOpened():
-                raise RuntimeError('No se pudo abrir la cámara. Revisa los permisos de macOS.')
-            generation = 0
-            controller = m.GestureController(a, emit=lambda event: self.events.put((generation, event)) if event["type"] == "MOUTH_OPEN" else None)
-            start, stamp = time.monotonic(), -1
-            while not self.quit.is_set():
-                try:
-                    while True:
-                        generation, settings = self.commands.get_nowait()
-                        for key, value in validate(settings).items():
-                            setattr(a, key, value)
-                        controller = m.GestureController(a, emit=lambda event: self.events.put((generation, event)) if event["type"] == "MOUTH_OPEN" else None)
-                except queue.Empty:
-                    pass
-                ok, frame = cap.read()
-                now = time.monotonic()
-                if not ok:
-                    controller.fault('lectura_camara')
-                    self.publish({'status': 'No llegan imágenes de la cámara', 'generation': generation,
-                                  'at': now, 'direction': None})
-                    self.quit.wait(.05)
-                    continue
-                frame = m.cv2.flip(frame, 1)
-                # Reducir la carga de procesamiento y mantener proporciones.
-                h, w = frame.shape[:2]
-                if w > 640:
-                    frame = m.cv2.resize(frame, (640, round(h * 640 / w)))
-                h, w = frame.shape[:2]
-                rgb = m.cv2.cvtColor(frame, m.cv2.COLOR_BGR2RGB)
-                stamp = max(stamp + 1, int((now - start) * 1000))
-                result = detector.detect_for_video(m.mp.Image(image_format=m.mp.ImageFormat.SRGB, data=rgb), stamp)
-                # El tiempo corresponde a la captura, no a la finalización de inferencia.
-                dx = dy = db = blink = None
-                if result.face_landmarks:
-                    face = result.face_landmarks[0]
-                    pose = m.head_pose(face, w, h)
-                    if pose is None:
-                        controller.fault('rostro_no_confiable')
-                    else:
-                        x, y = pose
-                        brow, blink = m.brow_metric(face, w, h), m.blink_metric(face, w, h)
-                        controller.feed(x, y, brow, blink, True, now, mouth=m.mouth_metric(face, w, h))
-                        if controller.baseline is not None:
-                            bx, by, bb = controller.baseline
-                            dx = (x - bx) * (-1 if a.invert_x else 1)
-                            dy = (y - by) * (-1 if a.invert_y else 1)
-                            db = brow - bb
-                    m.draw_landmarks(frame, face, w, h)
-                else:
-                    # En esta integración, un frame sin rostro ya cancela la intención.
-                    controller.fault('rostro_no_detectado')
-                if controller.last_fault:
-                    status = {'rostro_no_detectado': 'Rostro no detectado', 'ojos_cerrados': 'Ojos cerrados: vuelve al centro'}.get(controller.last_fault, 'Seguimiento no confiable')
-                elif controller.baseline is None:
-                    status = 'Calibrando: mira al centro con cejas relajadas'
-                elif controller.candidate == 'BOCA':
-                    status = 'Sostén la apertura' if controller.mouth_ready else 'Boca registrada o bloqueada: ciérrala para rearmar'
-                elif controller.active:
-                    status = 'Gesto confirmado: ' + controller.active.lower()
-                elif controller.armed:
-                    status = 'Listo: dirección, cejas o apertura de boca'
-                else:
-                    status = 'Vuelve al centro para habilitar el siguiente gesto'
-                required = a.mouth_hold if controller.candidate == 'BOCA' else a.center_hold if controller.candidate == 'CENTRO' else a.mode_hold if controller.candidate == 'MODO' else a.hold
-                progress = min(100, max(0, (now - controller.since) / required * 100)) if controller.candidate not in (None, 'AMBIGUO') else 0
-                m.draw_hud(frame, controller, a, dx, dy, db, blink, now, w, h)
-                self.publish(dict(status=status, generation=generation, at=now, direction=controller.active,
-                                  mode=controller.mode, progress=progress,
-                                  image=m.cv2.cvtColor(frame, m.cv2.COLOR_BGR2RGB)))
-        except Exception as exc:
-            self.publish({'status': f'Cámara: {type(exc).__name__}: {exc}', 'error': True})
-        finally:
-            if cap is not None:
-                cap.release()
-            if detector is not None:
-                detector.close()
+            return self.latest
 
+    def close(self):
+        self.quit.set()
+
+    def run(self):
+        capture = None
+        sequence = 0
+
+        try:
+            capture = vision.open_camera(self.index)
+            if not capture.isOpened():
+                raise RuntimeError(
+                    f"No se pudo abrir la cámara {self.index}"
+                )
+
+            while not self.quit.is_set():
+                ok, frame = capture.read()
+                sequence += 1
+
+                with self.lock:
+                    self.latest = (
+                        sequence,
+                        time.monotonic(),
+                        frame if ok else None,
+                    )
+
+                if not ok:
+                    self.error = f"Sin imagen de cámara {self.index}"
+                    self.quit.wait(.03)
+                else:
+                    self.error = ""
+
+        except Exception as exc:
+            self.error = str(exc)
+
+        finally:
+            if capture is not None:
+                capture.release()
+
+
+class FaceWorker(threading.Thread):
+    """Procesa exclusivamente la cámara frontal; no accede a Tkinter."""
+
+    def __init__(self, source, args, generation):
+        super().__init__(daemon=True, name="face-processing")
+        self.source = source
+        self.args = copy.deepcopy(args)
+        self.generation = generation
+        self.state = "MENU"
+
+        self.quit = threading.Event()
+        self.commands = queue.Queue()
+        self.events = queue.Queue()
+        self.lock = threading.Lock()
+        self.latest = {}
+        self.error = ""
+
+    def set_state(self, generation, state):
+        self.commands.put((generation, state))
+
+    def read(self):
+        with self.lock:
+            return self.latest.copy()
+
+    def close(self):
+        self.quit.set()
+
+    def _emit(self, event):
+        self.events.put((self.generation, event))
+
+    def run(self):
+        detector = None
+
+        try:
+            a = self.args
+            model = Path(a.models_dir)
+            if not model.is_absolute():
+                model = ROOT / model
+            model = model / "face_landmarker.task"
+            vision.ensure_model(model)
+
+            base = vision.mp.tasks.BaseOptions
+            delegate = (
+                base.Delegate.GPU if a.gpu else base.Delegate.CPU
+            )
+
+            try:
+                detector = vision._create_face_landmarker(
+                    model, a, delegate
+                )
+            except Exception:
+                if not a.gpu:
+                    raise
+                detector = vision._create_face_landmarker(
+                    model, a, base.Delegate.CPU
+                )
+
+            controller = GestureController(a, emit=self._emit)
+            smoother = vision.EMASmoother(a.smooth_alpha)
+
+            previous_sequence = -1
+            timestamp = -1
+
+            while not self.quit.is_set():
+                try:
+                    while True:
+                        self.generation, self.state = (
+                            self.commands.get_nowait()
+                        )
+
+                        # Reiniciar la selección al cambiar de pantalla.
+                        # Se conserva la calibración facial.
+                        controller.active = None
+                        controller.candidate = None
+                        controller.armed = False
+                        controller.since = time.monotonic()
+
+                except queue.Empty:
+                    pass
+
+                # La UI gobierna el destino del gesto.
+                # El algoritmo y a.hold permanecen intactos.
+                controller.mode = (
+                    "MOVIMIENTO"
+                    if self.state == "DRIVE"
+                    else "INTERACCION"
+                )
+                a.mode_hold = (
+                    a.interact_page_hold
+                    if self.state == "INTERACT"
+                    else self.args.mode_hold
+                )
+
+                sequence, captured_at, frame = self.source.read()
+                if sequence == previous_sequence:
+                    self.quit.wait(.005)
+                    continue
+
+                previous_sequence = sequence
+                now = time.monotonic()
+                valid = False
+                image = None
+                gaze = None
+
+                if frame is None:
+                    controller.fault("lectura_camara")
+                    smoother.reset()
+
+                else:
+                    image = cv2.flip(frame, 1)
+                    h, w = image.shape[:2]
+                    if w > 640:
+                        image = cv2.resize(
+                            image, (640, round(h * 640 / w))
+                        )
+                    h, w = image.shape[:2]
+
+                    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    timestamp = max(
+                        timestamp + 1, int(captured_at * 1000)
+                    )
+                    result = detector.detect_for_video(
+                        vision.mp.Image(
+                            image_format=vision.mp.ImageFormat.SRGB,
+                            data=rgb,
+                        ),
+                        timestamp,
+                    )
+
+                    if not result.face_landmarks:
+                        controller.fault("rostro_no_detectado")
+                        smoother.reset()
+                    else:
+                        face = result.face_landmarks[0]
+                        pose = vision.head_pose(face, w, h)
+
+                        if pose is None:
+                            controller.fault("rostro_no_confiable")
+                            smoother.reset()
+                        else:
+                            x = smoother.apply("x", pose[0])
+                            y = smoother.apply("y", pose[1])
+                            brow = smoother.apply(
+                                "brow", vision.brow_metric(face, w, h)
+                            )
+                            blink = smoother.apply(
+                                "blink", vision.blink_metric(face, w, h)
+                            )
+                            controller.feed(
+                                x, y, brow, blink, True, now,
+                                mouth=vision.mouth_metric(face, w, h),
+                            )
+                            valid = controller.last_fault is None
+                            if valid and controller.baseline is not None:
+                                bx, by, _ = controller.baseline
+                                gaze = (
+                                    (x - bx) * (-1 if a.invert_x else 1),
+                                    (y - by) * (-1 if a.invert_y else 1),
+                                )
+
+                        vision.draw_landmarks(image, face, w, h)
+
+                with self.lock:
+                    self.latest = {
+                        "generation": self.generation,
+                        "at": captured_at,
+                        "frame": image,
+                        "gaze": gaze,
+                        "valid": valid,
+                        "calibrated": controller.baseline is not None,
+                        "candidate": controller.candidate,
+                        "active": controller.active,
+                    }
+
+        except Exception as exc:
+            self.error = str(exc)
+            self._emit({
+                "type": "STOP",
+                "monotonic": time.monotonic(),
+                "reason": str(exc),
+            })
+
+        finally:
+            if detector is not None:
+                detector.close()
 
 class Panel:
-    def __init__(self, root):
-        self.root, self.intent = root, Intent()
-        self.worker = None
-        self.serial_output = None
+    def __init__(self, root, args):
+        self.root = root
+        self.args = args
+        self.config = validate({
+            key: getattr(args, key) for key in DEFAULTS
+        })
+
+        self.state = "MENU"
         self.generation = 0
-        self.timers, self.held, self.blocked = {}, set(), set()
-        self.mouse = None
-        self.last_image = None
-        self.settings_window = None
-        self.mouth_count = 0
-        config_error = None
-        try:
-            self.settings = load_config()
-        except (OSError, ValueError) as exc:
-            self.settings = defaults()
-            config_error = str(exc)
-        root.title('MOVA | Manual y gestos · Arduino')
-        root.geometry('1080x840')
-        root.minsize(960, 780)
-        root.configure(bg=BG)
-        header = tk.Frame(root, bg=LILA, padx=24, pady=16)
-        header.pack(fill='x')
-        self.label(header, 'MOVA', 25, bg=LILA).pack(side='left')
-        self.label(header, 'CONTROL ARDUINO · SALIDA USB', 11, bg=LILA).pack(side='right')
-        usb = tk.Frame(root, bg=BG, padx=24, pady=8)
-        usb.pack(fill='x')
-        self.label(usb, 'Puerto USB:', 11).pack(side='left')
-        self.port = tk.StringVar(value='/dev/cu.usbmodem14101')
-        self.ports = ttk.Combobox(usb, textvariable=self.port, width=32)
-        self.ports.pack(side='left', padx=8)
-        self.button(usb, 'Buscar puertos', self.find_ports).pack(side='left', padx=4)
-        self.button(usb, 'Conectar', self.connect_usb).pack(side='left', padx=4)
-        self.button(usb, 'Desconectar', self.disconnect_usb).pack(side='left', padx=4)
-        self.usb_status = self.label(root, 'USB desconectado · no se envían órdenes', 11)
-        self.usb_status.pack(fill='x')
-        controls = tk.Frame(root, bg=BG, padx=24, pady=14)
-        controls.pack(fill='x')
-        self.source = tk.StringVar(value='Manual')
-        for source in ('Manual', 'Gestos'):
-            tk.Radiobutton(controls, text=source, value=source, variable=self.source, command=self.change_source, bg=BG, fg=INK).pack(side='left', padx=8)
-        self.button(controls, 'Iniciar cámara', self.start_camera).pack(side='right', padx=6)
-        self.button(controls, 'Calibrar', self.calibrate).pack(side='right', padx=6)
-        self.button(controls, 'Ajustes de gestos', self.open_settings).pack(side='right', padx=6)
-        body = tk.Frame(root, bg=BG)
-        body.pack(fill='both', expand=True, padx=24)
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=2)
-        body.rowconfigure(0, weight=1)
-        left = tk.Frame(body, bg='white', padx=12, pady=12)
-        left.grid(row=0, column=0, sticky='nsew', padx=(0, 16))
-        self.video = self.label(left, 'Inicia la cámara para probar los gestos', 13, bg='white')
-        self.video.pack(fill='both', expand=True)
-        self.camera_status = self.label(left, 'Cámara apagada', 12, bg='white')
-        self.camera_status.configure(wraplength=520)
-        self.camera_status.pack(fill='x', pady=8)
-        self.progress = ttk.Progressbar(left, maximum=100)
-        self.progress.pack(fill='x')
-        self.invert_x = tk.BooleanVar(value=self.settings['invert_x'])
-        self.invert_y = tk.BooleanVar(value=self.settings['invert_y'])
-        for title, var in [('Invertir izquierda / derecha', self.invert_x), ('Invertir adelante / atrás', self.invert_y)]:
-            tk.Checkbutton(left, text=title, variable=var, command=self.calibrate, bg='white', fg=INK).pack(anchor='w')
-        right = tk.Frame(body, bg='white', padx=20, pady=16)
-        right.grid(row=0, column=1, sticky='nsew')
-        self.label(right, 'ORDEN SOLICITADA', 12, bg='white').pack()
-        self.order = self.label(right, 'NEUTRO', 23, bg='white')
-        self.order.pack(pady=12)
-        self.mode = self.label(right, 'Control manual', 12, bg='white')
-        self.mode.pack()
-        self.mouth_status = self.label(right, 'Boca: sin eventos · acción pendiente', 10, bg='white')
-        self.mouth_status.pack()
-        pad = tk.Frame(right, bg='white')
-        pad.pack(pady=18)
-        self.buttons = {}
-        for key, title, r, c in [('w', '↑\nW', 0, 1), ('a', '←\nA', 1, 0), ('s', '↓\nS', 1, 1), ('d', '→\nD', 1, 2)]:
-            b = tk.Label(pad, text=title, font=('Arial', 19, 'bold'), bg=BG, fg=INK, width=4, height=2, relief='ridge', cursor='hand2')
-            b.grid(row=r, column=c, padx=3, pady=3)
-            b.bind('<ButtonPress-1>', lambda e, k=key: self.mouse_down(k))
-            b.bind('<Leave>', self.mouse_up)
-            self.buttons[key] = b
-        self.duty = self.label(right, 'Vertical: 128\nHorizontal: 128', 13, bg='white')
-        self.duty.pack(pady=10)
-        self.help = self.label(right, 'Manual: mantén WASD, flechas o botones.\n\nGestos: calibra, vuelve al centro y levanta las cejas 1,2 s para cambiar a Movimiento.', 12, bg='white')
-        self.help.configure(wraplength=300, justify='left')
-        self.help.pack(pady=10)
-        footer = tk.Frame(root, bg=BG, padx=24, pady=16)
-        footer.pack(fill='x')
-        self.enable_button = self.button(footer, 'Activar control', self.enable)
-        self.enable_button.pack(side='left')
-        self.state = self.label(footer, 'Pausado', 12)
-        self.state.pack(side='left', padx=16)
-        stop = self.button(footer, 'DETENER · Esc', self.stop)
-        stop.configure(font=('Arial', 17, 'bold'))
-        stop.pack(side='right')
-        root.bind('<KeyPress>', self.key_down)
-        root.bind('<KeyRelease>', self.key_up)
-        root.bind('<ButtonRelease-1>', self.mouse_up)
-        root.bind('<FocusOut>', lambda e: root.after_idle(self.check_focus))
-        root.protocol('WM_DELETE_WINDOW', self.close)
+        self.page_index = 0
+        self.direction = None
+        self.gaze = None
+        self.last_move = 0.0
+        self.menu_candidate = None
+        self.menu_since = None
+        self.menu_progress = 0.0
+        self.keys = set()
+        self.release_jobs = {}
+        self.closing = False
+        self.restarting = False
+        self.editor = None
+        self.message = ""
+
+        self.fonts = {}
+        self.icons = {}
+        self.threads = []
+        self.worker = None
+        self.front = None
+        self.rear = None
+
+        self.arduino_output = ArduinoAdapter(lambda: self.state)
+        self.alexa = AlexaDispatcher(self.config)
+
+        root.title("MOVA · Pulse")
+        root.resizable(False, False)
+
+        self.video = tk.Label(root, borderwidth=0)
+        self.video.pack()
+        self.video.bind("<Button-1>", self._image_click)
+
+        self.manual_controls = ttk.Frame(root, padding=6)
+        self.manual_controls.pack(fill="x")
+
+        for title, state in (
+            ("Menú", "MENU"),
+            ("Conducción", "DRIVE"),
+            ("Interacción", "INTERACT"),
+        ):
+            ttk.Button(
+                self.manual_controls,
+                text=title,
+                command=lambda s=state: self.change_state(s),
+            ).pack(side="left", padx=3)
+
+        for symbol, direction in zip(
+            ("↑", "→", "↓", "←"), DIRECTIONS
+        ):
+            button = ttk.Button(self.manual_controls, text=symbol)
+            button.pack(side="left", padx=3)
+            button.bind(
+                "<ButtonPress-1>",
+                lambda event, d=direction: self._manual_press(d),
+            )
+
+        if not args.manual:
+            self.manual_controls.pack_forget()
+        else:
+            root.bind("<KeyPress>", self._key_down)
+            root.bind("<KeyRelease>", self._key_up)
+            root.bind("<ButtonRelease-1>", self._mouse_release)
+            root.bind("<Escape>", lambda event: self.change_state("MENU"))
+
+        self._build_settings()
+        self._start_workers()
+
+        root.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
-        if config_error:
-            root.after_idle(lambda: messagebox.showerror('Configuración no cargada',
-                config_error + '\nSe usan los valores predeterminados; el archivo no fue reemplazado.'))
 
-    def open_settings(self):
-        if self.settings_window and self.settings_window.winfo_exists():
-            self.settings_window.lift()
+    def _start_workers(self):
+        for key, value in self.config.items():
+            setattr(self.args, key, copy.deepcopy(value))
+
+        self.front = VideoSource(self.config["cam_front_index"])
+
+        if self.config["cam_rear_index"] == self.config["cam_front_index"]:
+            self.rear = self.front
+        else:
+            self.rear = VideoSource(self.config["cam_rear_index"])
+
+        self.worker = FaceWorker(
+            self.front, self.args, self.generation
+        )
+        self.worker.set_state(self.generation, self.state)
+
+        self.threads = list(dict.fromkeys(
+            [self.front, self.rear, self.worker]
+        ))
+        for thread in self.threads:
+            thread.start()
+
+    def _restart_workers(self):
+        if self.restarting:
             return
-        self.stop()
-        win = self.settings_window = tk.Toplevel(self.root)
-        win.title('Ajustes de gestos · MediaPipe')
-        win.transient(self.root)
-        win.grab_set()  # El teclado de ajustes no controla el movimiento.
-        box = ttk.Frame(win, padding=16)
-        box.pack(fill='both', expand=True)
-        ttk.Label(box, text='Menor umbral = más sensibilidad. Tab cambia de campo; flechas ajustan.').grid(
-            row=0, column=0, columnspan=4, sticky='w', pady=(0, 12))
-        fields = [
-            ('threshold_x', 'Horizontal (rad)', .01), ('threshold_y', 'Vertical (rad)', .01),
-            ('release', 'Zona central (rad)', .01), ('diagonal_ratio', 'Dominancia inicial (menor = más ancho)', .05),
-            ('sustain_ratio', 'Dominancia sostenida (menor = más tolerancia)', .05),
-            ('hold', 'Confirmar dirección (s)', .05), ('center_hold', 'Confirmar centro (s)', .05),
-            ('brow', 'Umbral de cejas', .05), ('mode_hold', 'Confirmar cejas (s)', .1),
-            ('blink', 'Umbral de ojos cerrados', .1), ('calibration', 'Calibración (s)', .5),
-            ('mouth_open', 'Boca: apertura / ancho', .01), ('mouth_close', 'Boca: cierre / ancho', .01),
-            ('mouth_hold', 'Confirmar apertura (s)', .05), ('mouth_close_hold', 'Confirmar cierre (s)', .05),
-        ]
-        variables = {}
-        for row, (key, label, step) in enumerate(fields, 1):
-            ttk.Label(box, text=label).grid(row=row, column=0, sticky='w', padx=(0, 15), pady=3)
-            var = variables[key] = tk.StringVar(value=str(self.settings[key]))
-            ttk.Spinbox(box, textvariable=var, from_=step, to=100, increment=step, width=12).grid(
-                row=row, column=1, sticky='ew')
-        row = len(fields) + 1
-        for key, label in [('invert_x', 'Invertir horizontal'), ('invert_y', 'Invertir vertical')]:
-            var = variables[key] = tk.BooleanVar(value=getattr(self, key).get())
-            ttk.Checkbutton(box, text=label, variable=var).grid(row=row, column=0, columnspan=2, sticky='w')
-            row += 1
-        feedback = ttk.Label(box, text='Aplicar pausa el control y vuelve a calibrar.')
-        feedback.grid(row=row, column=0, columnspan=2, pady=8)
 
-        def apply(persist=False):
-            try:
-                values = validate({key: var.get() if key.startswith('invert_') else float(var.get())
-                                   for key, var in variables.items()})
-                if persist:
-                    save_config(values)
-                self.settings = values
-                self.invert_x.set(values['invert_x'])
-                self.invert_y.set(values['invert_y'])
-                self.stop()
-                self.reset_camera()
-                feedback.configure(text='Guardado y aplicado.' if persist else 'Aplicado; aún no guardado.')
-            except (ValueError, OSError, tk.TclError) as exc:
-                messagebox.showerror('Ajustes inválidos', str(exc), parent=win)
-
-        def reload_values():
-            try:
-                values = load_config()
-                for key, var in variables.items():
-                    var.set(values[key])
-                feedback.configure(text='Archivo cargado en los campos; pulsa Aplicar.')
-            except (ValueError, OSError) as exc:
-                messagebox.showerror('No se pudo cargar', str(exc), parent=win)
-
-        buttons = ttk.Frame(box)
-        buttons.grid(row=row+1, column=0, columnspan=2, pady=8)
-        for label, command in [('Aplicar', apply), ('Aplicar y guardar', lambda: apply(True)),
-                               ('Recargar archivo', reload_values), ('Cerrar', win.destroy)]:
-            ttk.Button(buttons, text=label, command=command).pack(side='left', padx=3)
-        win.bind('<Escape>', lambda event: win.destroy())
-
-    def label(self, parent, text, size, bg=BG):
-        return tk.Label(parent, text=text, font=('Arial', size), bg=bg, fg=INK)
-
-    def button(self, parent, text, command):
-        return tk.Button(parent, text=text, command=command, fg=INK, highlightbackground=LILA, padx=10, pady=7)
-
-    def stop(self):
-        self.blocked.update(self.held)
-        self.intent.stop()
-        if self.serial_output:
-            self.serial_output.stop()
-        self.mouse = None
-        self.state.configure(text='Pausado · pulsa Activar control')
-        self.enable_button.configure(state='normal')
-
-    def enable(self):
-        if not self.serial_output or not self.serial_output.arm():
-            self.state.configure(text='Conecta el Arduino primero')
-            return
-        self.blocked.update(self.held)
-        self.intent.inputs.clear()
-        self.intent.direction = None
-        if self.source.get() == 'Gestos':
-            self.start_camera()
-            self.reset_camera()
-        self.intent.enabled = True
-        self.state.configure(text='Control activo · salida USB')
-        self.enable_button.configure(state='disabled')
-        self.root.focus_set()
-
-    def change_source(self):
-        self.stop()
-        self.intent.source = self.source.get()
-        if self.intent.source == 'Gestos':
-            self.start_camera()
-
-    def start_camera(self):
-        if self.worker and self.worker.is_alive():
-            return
-        self.worker = Camera()
-        self.reset_camera()
-        self.worker.start()
-
-    def reset_camera(self):
+        self.restarting = True
         self.generation += 1
-        if self.worker:
-            self.settings.update(invert_x=self.invert_x.get(), invert_y=self.invert_y.get())
-            self.worker.commands.put((self.generation, self.settings.copy()))
+        self._stop_motion()
+        self.worker = None
 
-    def calibrate(self):
-        self.stop()
-        self.start_camera()
-        self.reset_camera()
+        old_threads = list(self.threads)
+        for thread in old_threads:
+            thread.close()
 
-    def key_down(self, event):
-        if isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox)):
-            if event.keysym.lower() == 'escape':
-                self.stop()
+        def finish():
+            if self.closing:
+                return
+            if any(thread.is_alive() for thread in old_threads):
+                self.root.after(30, finish)
+                return
+
+            self._start_workers()
+            self.restarting = False
+
+        finish()
+
+    def _stop_motion(self):
+        self.direction = None
+        self.last_move = 0.0
+        self.keys.clear()
+        self.arduino_output.send_stop()
+
+    def change_state(self, state):
+        if state not in ("MENU", "DRIVE", "INTERACT", "SETTINGS"):
+            raise ValueError(f"Estado desconocido: {state}")
+
+        self._stop_motion()
+        self.state = state
+        self.generation += 1
+
+        self.menu_candidate = None
+        self.menu_since = None
+        self.menu_progress = 0.0
+
+        if self.worker is not None:
+            self.worker.set_state(self.generation, state)
+
+        if self.editor is not None and self.editor.winfo_exists():
+            self.editor.destroy()
+        self.editor = None
+
+        if state == "SETTINGS":
+            self.settings_panel.place(x=100, y=150, width=824, height=350)
+        else:
+            self.settings_panel.place_forget()
+
+    def _handle_event(self, event):
+        kind = event["type"]
+
+        if kind == "MOUTH_OPEN":
+            self.change_state("MENU")  # Incluye send_stop().
             return
-        key = event.keysym.lower()
-        if key == 'escape':
-            self.stop()
-        if key not in KEYS:
+
+        # Nombre normalizado en la capa de UI.
+        if kind == "MODE":
+            kind = "MODE_SWITCH"
+
+        if self.state == "DRIVE":
+            if kind == "STOP":
+                self.direction = None
+                self.arduino_output.send_stop()
+
+            elif kind in ("MOVE", "HEARTBEAT") and not self.keys:
+                direction = event.get("direction")
+                if direction in DIRECTIONS:
+                    self.direction = direction
+                    self.last_move = event["monotonic"]
+
+        elif self.state == "INTERACT":
+            if kind == "MODE_SWITCH":
+                self.page_index = (
+                    self.page_index + 1
+                ) % self.alexa.page_count
+
+            elif kind == "INTERACT":
+                self._execute_direction(event.get("direction"))
+
+    def _execute_direction(self, direction):
+        if self.state != "INTERACT" or direction not in DIRECTIONS:
             return
-        if key in self.timers:
-            self.root.after_cancel(self.timers.pop(key))
-        self.held.add(key)
-        if self.intent.enabled and self.intent.source == 'Manual' and key not in self.blocked:
-            self.intent.inputs.add(key)
 
-    def key_up(self, event):
-        key = event.keysym.lower()
-        if key in KEYS:
-            if key in self.timers:
-                self.root.after_cancel(self.timers.pop(key))
-            self.timers[key] = self.root.after(50, lambda: self.release_key(key))
+        commands = self.alexa.get_commands_for_page(self.page_index)
+        command = commands[DIRECTIONS.index(direction)]
+        self.alexa.execute(command)
 
-    def release_key(self, key):
-        self.timers.pop(key, None)
-        self.held.discard(key)
-        self.blocked.discard(key)
-        self.intent.inputs.discard(key)
+        if command is not None:
+            self.message = "En cola: " + command["phrase"]
 
-    def mouse_down(self, key):
-        self.root.focus_set()
-        if self.intent.enabled and self.intent.source == 'Manual':
-            self.mouse = key
+    def _update_menu(self, data, fresh):
+        candidate = data.get("candidate")
+        eligible = (
+            fresh
+            and data.get("valid")
+            and data.get("calibrated")
+            and candidate in ("ADELANTE", "ATRAS")
+        )
 
-    def mouse_up(self, event=None):
-        self.mouse = None
+        if not eligible:
+            self.menu_candidate = None
+            self.menu_since = None
+            self.menu_progress = 0.0
+            return
 
-    def check_focus(self):
-        if self.root.focus_displayof() is None:
-            self.stop()
-            self.held.clear()
-            self.blocked.clear()
-            for timer in self.timers.values():
-                self.root.after_cancel(timer)
-            self.timers.clear()
+        if candidate != self.menu_candidate:
+            self.menu_candidate = candidate
+            self.menu_since = data["at"]
+
+        # Usar el tiempo de las imágenes evita avanzar el progreso
+        # cuando todavía no ha llegado otro frame.
+        elapsed = max(0.0, data["at"] - self.menu_since)
+        self.menu_progress = min(
+            1.0, elapsed / self.config["menu_hold"]
+        )
+
+        if self.menu_progress >= 1.0:
+            self.change_state(
+                "DRIVE" if candidate == "ADELANTE" else "INTERACT"
+            )
 
     def refresh(self):
+        if self.closing:
+            return
+
         now = time.monotonic()
-        if self.serial_output:
-            ready, enabled, status, sent = self.serial_output.info()
-            suffix = f' · Último envío: {sent[0]}, {sent[1]}' if sent else ''
-            self.usb_status.configure(text=status + suffix)
-            if self.intent.enabled and (not ready or not enabled):
-                self.stop()
-        if self.worker:
+        data = self.worker.read() if self.worker is not None else {}
+
+        events = []
+        if self.worker is not None:
             try:
                 while True:
                     generation, event = self.worker.events.get_nowait()
-                    if generation == self.generation and now - event['monotonic'] <= .5:
-                        self.mouth_count += 1
-                        self.mouth_status.configure(text=f'Boca: {self.mouth_count} apertura(s) · acción pendiente')
+                    if (
+                        generation == self.generation
+                        and now - event["monotonic"] <= self.args.stale
+                    ):
+                        events.append(event)
             except queue.Empty:
                 pass
-        data = self.worker.read() if self.worker else None
-        if data:
-            self.camera_status.configure(text=data['status'])
-            fresh = now - data.get('at', 0) <= .5 and data.get('generation') == self.generation
-            self.progress['value'] = data.get('progress', 0) if fresh else 0
-            if self.intent.source == 'Gestos':
-                self.mode.configure(text='Gestos · ' + data.get('mode', 'PREPARANDO'))
-                self.intent.direction = data.get('direction') if fresh else None
-                self.intent.last = data.get('at', 0)
-                if not fresh and data.get('at'):
-                    self.camera_status.configure(text='Esperando datos recientes · orden neutra')
-            if data.get('image') is not None and data['image'] is not self.last_image:
-                try:
-                    from PIL import Image, ImageTk
-                    img = Image.fromarray(data['image'])
-                    img.thumbnail((max(100, self.video.winfo_width()), max(100, self.video.winfo_height())))
-                    self.photo = ImageTk.PhotoImage(img)
-                    self.video.configure(image=self.photo, text='')
-                    self.last_image = data['image']
-                except ImportError:
-                    self.camera_status.configure(text='Falta Pillow: instala requirements.txt')
-        if self.intent.source == 'Manual':
-            self.mode.configure(text='Control manual')
-        # Ratón y teclado permanecen independientes incluso en la misma dirección.
-        original = self.intent.inputs
-        self.intent.inputs = original | ({self.mouse} if self.mouse else set())
-        v, h = self.intent.values(now)
-        self.intent.inputs = original
-        if self.serial_output and self.intent.enabled:
-            deadline = now + .5
-            if self.intent.source == 'Gestos' and (v, h) != (128, 128):
-                deadline = min(deadline, self.intent.last + .5)
-            self.serial_output.submit(v, h, deadline)
-        names = []
-        if v != 128:
-            names.append('ADELANTE' if v > 128 else 'ATRÁS')
-        if h != 128:
-            names.append('DERECHA' if h > 128 else 'IZQUIERDA')
-        self.order.configure(text=' + '.join(names) or 'NEUTRO', font=('Arial', 16 if len(names) > 1 else 23))
-        self.duty.configure(text=f'Vertical: {v}\nHorizontal: {h}')
-        active = {'w': v > 128, 's': v < 128, 'a': h < 128, 'd': h > 128}
-        for key, button in self.buttons.items():
-            button.configure(bg=MENTA if active[key] else BG)
+
+        # La boca tiene prioridad sobre los demás eventos del lote.
+        mouth = next(
+            (e for e in events if e["type"] == "MOUTH_OPEN"), None
+        )
+        if mouth is not None:
+            self._handle_event(mouth)
+        else:
+            for event in events:
+                self._handle_event(event)
+
+        fresh = (
+            data.get("generation") == self.generation
+            and now - data.get("at", 0.0) <= self.args.stale
+        )
+
+        if self.state == "MENU":
+            self._update_menu(data, fresh)
+
+        # Único lugar de la UI que llama a send_move().
+        if self.state == "DRIVE":
+            if self.keys:
+                selected = set(self.keys)
+                deadline = now + .5
+            elif (
+                fresh
+                and data.get("valid")
+                and self.direction is not None
+                and now - self.last_move <= .5
+            ):
+                selected = {self.direction}
+                deadline = min(now + .5, self.last_move + .5)
+            else:
+                selected = set()
+                deadline = now + .5
+                self.direction = None
+
+            if selected:
+                # Misma conversión que Intent.values() del MOVA original.
+                vertical = 128 + 120 * (
+                    ("ADELANTE" in selected) - ("ATRAS" in selected)
+                )
+                horizontal = 128 + 120 * (
+                    ("DERECHA" in selected) - ("IZQUIERDA" in selected)
+                )
+                self.arduino_output.send_move(
+                    vertical, horizontal, deadline
+                )
+            else:
+                self.arduino_output.send_stop()
+
+        try:
+            while True:
+                result = self.alexa.results.get_nowait()
+                self.message = (
+                    "Reproducido: " if result["ok"] else "Audio: "
+                ) + result["message"]
+        except queue.Empty:
+            pass
+        self.gaze = (
+            data.get("gaze")
+            if (
+                data.get("generation") == self.generation
+                and now - data.get("at", 0.0) <= self.args.stale
+                and data.get("valid")
+            )
+            else None
+        )
+        face = data.get("frame")
+        candidate = data.get("candidate") if fresh else None
+
+        if self.state == "MENU":
+            canvas = self._render_menu(face)
+        elif self.state == "DRIVE":
+            reversing = (
+                "ATRAS" in self.keys
+                if self.keys
+                else self.direction == "ATRAS"
+            )
+            canvas = self._render_drive(face, reversing, candidate)
+        elif self.state == "INTERACT":
+            canvas = self._render_interact(face, candidate)
+        else:
+            canvas = self._base("Ajustes")
+
+        errors = [
+            source.error
+            for source in (self.front, self.rear, self.worker)
+            if source is not None and source.error
+        ]
+        status = errors[0] if errors else self.message
+        footer = f"{self.arduino_output.status()} · {status}"
+        self._text(canvas, footer[:110], (185, 557), size=13)
+
+        self.photo = ImageTk.PhotoImage(
+            Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        )
+        self.video.configure(image=self.photo)
         self.root.after(40, self.refresh)
+
+    def _manual_press(self, direction):
+        if not self.args.manual:
+            return
+        if self.state == "DRIVE":
+            self.keys.add(direction)
+        elif self.state == "MENU":
+            if direction in ("ADELANTE", "ATRAS"):
+                self.change_state(
+                    "DRIVE" if direction == "ADELANTE" else "INTERACT"
+                )
+        elif self.state == "INTERACT":
+            self._execute_direction(direction)
+
+    def _key_down(self, event):
+        if isinstance(
+            event.widget, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox)
+        ):
+            return
+
+        key = event.keysym.lower()
+        if key not in KEYS:
+            return
+
+        pending = self.release_jobs.pop(key, None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+
+        # El autorepeat no vuelve a ejecutar una interacción.
+        held = getattr(self, "_held_keys", set())
+        if key not in held:
+            held.add(key)
+            self._held_keys = held
+            self._manual_press(KEYS[key])
+
+    def _key_up(self, event):
+        key = event.keysym.lower()
+        if key not in KEYS:
+            return
+
+        pending = self.release_jobs.pop(key, None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+
+        def release():
+            self.release_jobs.pop(key, None)
+            held = getattr(self, "_held_keys", set())
+            held.discard(key)
+
+            direction = KEYS[key]
+            if not any(KEYS.get(k) == direction for k in held):
+                self.keys.discard(direction)
+
+        self.release_jobs[key] = self.root.after(50, release)
+
+    def _mouse_release(self, event):
+        # Mantener las direcciones que todavía provengan del teclado.
+        held = getattr(self, "_held_keys", set())
+        self.keys = {KEYS[k] for k in held if k in KEYS}
+
+    def _image_click(self, event):
+        x, y = event.x, event.y
+
+        if self.state == "MENU" and 850 <= x <= 1000 and 425 <= y <= 525:
+            self.change_state("SETTINGS")
+            return
+
+        if not self.args.manual:
+            return
+
+        dx, dy = x - 512, y - 325
+        distance = math.hypot(dx, dy)
+        if not 125 <= distance <= 235:
+            return
+
+        if self.state == "MENU":
+            self.change_state("DRIVE" if dy < 0 else "INTERACT")
+
+        elif self.state == "INTERACT":
+            if abs(dx) > abs(dy):
+                direction = "DERECHA" if dx > 0 else "IZQUIERDA"
+            else:
+                direction = "ATRAS" if dy > 0 else "ADELANTE"
+            self._execute_direction(direction)
+
+    def _build_settings(self):
+        self.settings_panel = ttk.Frame(self.video, padding=20)
+        panel = self.settings_panel
+        panel.columnconfigure(1, weight=1)
+
+        ttk.Label(panel, text="Puerto USB").grid(
+            row=0, column=0, sticky="w", padx=8, pady=12
+        )
+        self.port = tk.StringVar()
+        self.ports = ttk.Combobox(panel, textvariable=self.port)
+        self.ports.grid(row=0, column=1, sticky="ew", padx=8)
+
+        actions = ttk.Frame(panel)
+        actions.grid(row=1, column=0, columnspan=2, pady=12)
+
+        for title, callback in (
+            ("Buscar puertos", self.find_ports),
+            ("Conectar", self.connect_usb),
+            ("Desconectar", self.arduino_output.disconnect),
+            ("Ajuste de gestos", self.open_gesture_settings),
+        ):
+            ttk.Button(
+                actions, text=title, command=callback
+            ).pack(side="left", padx=5)
+
+        self.camera_variables = {}
+        for row, (key, title) in enumerate((
+            ("cam_front_index", "Cámara frontal"),
+            ("cam_rear_index", "Cámara trasera"),
+        ), start=2):
+            ttk.Label(panel, text=title).grid(
+                row=row, column=0, sticky="w", padx=8, pady=10
+            )
+            variable = tk.StringVar(value=str(self.config[key]))
+            self.camera_variables[key] = variable
+            ttk.Entry(panel, textvariable=variable).grid(
+                row=row, column=1, sticky="ew", padx=8
+            )
+
+        ttk.Button(
+            panel,
+            text="Aplicar y guardar cámaras",
+            command=self.apply_cameras,
+        ).grid(row=4, column=0, columnspan=2, pady=12)
+
+        ttk.Button(
+            panel,
+            text="Regresar",
+            command=lambda: self.change_state("MENU"),
+        ).grid(row=5, column=0, columnspan=2, pady=12)
 
     def find_ports(self):
         try:
             from serial.tools import list_ports
-            ports = [p.device for p in list_ports.comports()]
-            self.ports['values'] = ports
+
+            ports = [port.device for port in list_ports.comports()]
+            self.ports["values"] = ports
             if ports and self.port.get() not in ports:
                 self.port.set(ports[0])
-            if not ports:
-                self.state.configure(text='No se encontraron puertos USB')
         except Exception as exc:
-            self.state.configure(text=f'Puertos: {exc}')
+            messagebox.showerror("Puertos", str(exc), parent=self.root)
 
     def connect_usb(self):
-        self.stop()
-        if self.serial_output and self.serial_output.is_alive():
-            self.state.configure(text='Desconecta el puerto actual primero')
-            return
-        port = self.port.get().strip()
-        if not port:
-            self.state.configure(text='Selecciona un puerto USB')
-            return
-        self.serial_output = ArduinoOutput(port)
-        self.serial_output.start()
+        try:
+            port = self.port.get().strip()
+            if not port:
+                raise ValueError("Selecciona un puerto USB.")
+            self.arduino_output.connect(port)
+        except Exception as exc:
+            messagebox.showerror("USB", str(exc), parent=self.root)
 
-    def disconnect_usb(self):
-        self.stop()
-        if self.serial_output:
-            self.serial_output.close()
+    def _apply_config(self, values):
+        if self.restarting:
+            raise ValueError("Las cámaras todavía se están reiniciando.")
+
+        values = validate(values)
+        save_config(values, path=self.args.config)
+        self.config = values
+        self.message = "Configuración guardada"
+        self._restart_workers()
+
+    def apply_cameras(self):
+        try:
+            values = copy.deepcopy(self.config)
+            for key, variable in self.camera_variables.items():
+                values[key] = int(variable.get())
+            self._apply_config(values)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Cámaras", str(exc), parent=self.root)
+
+    def open_gesture_settings(self):
+        if self.editor is not None and self.editor.winfo_exists():
+            self.editor.lift()
+            return
+
+        self.editor = tk.Toplevel(self.root)
+        self.editor.title("Ajuste de gestos")
+        self.editor.transient(self.root)
+
+        variables = {}
+        excluded = {
+            "alexa_commands", "cam_front_index", "cam_rear_index", "hold"
+        }
+
+        for i, (key, value) in enumerate(
+            (item for item in self.config.items() if item[0] not in excluded)
+        ):
+            row, column = i % 9, (i // 9) * 2
+            ttk.Label(self.editor, text=key).grid(
+                row=row, column=column, padx=8, pady=6, sticky="w"
+            )
+
+            if isinstance(value, bool):
+                variable = tk.BooleanVar(value=value)
+                widget = ttk.Checkbutton(
+                    self.editor, variable=variable
+                )
+            else:
+                variable = tk.StringVar(value=str(value))
+                widget = ttk.Entry(
+                    self.editor, textvariable=variable, width=10
+                )
+
+            variables[key] = variable
+            widget.grid(
+                row=row, column=column + 1, padx=8, pady=6
+            )
+
+        ttk.Label(
+            self.editor,
+            text=f"Confirmación de gestos: hold = {self.config['hold']} s",
+        ).grid(row=10, column=0, columnspan=6, pady=10)
+
+        def apply():
+            try:
+                values = copy.deepcopy(self.config)
+                for key, variable in variables.items():
+                    values[key] = (
+                        variable.get()
+                        if isinstance(self.config[key], bool)
+                        else float(variable.get())
+                    )
+                self._apply_config(values)
+                self.editor.destroy()
+                self.editor = None
+            except (ValueError, OSError, tk.TclError) as exc:
+                messagebox.showerror(
+                    "Ajustes", str(exc), parent=self.editor
+                )
+
+        ttk.Button(
+            self.editor, text="Aplicar y guardar", command=apply
+        ).grid(row=11, column=0, columnspan=6, pady=12)
 
     def close(self):
-        self.stop()
-        if self.serial_output:
-            self.serial_output.close()
-            self.serial_output.join(timeout=.8)
-        if self.worker:
-            self.worker.quit.set()
+        self.closing = True
+        self._stop_motion()
+        self.arduino_output.disconnect()
+        self.alexa.close()
+        for thread in self.threads:
+            thread.close()
         self.root.destroy()
+    def _text(
+        self, canvas, text, position, size=22, color=INK, center=False
+    ):
+        if size not in self.fonts:
+            try:
+                self.fonts[size] = ImageFont.truetype(
+                    "DejaVuSans.ttf", size
+                )
+            except OSError:
+                self.fonts[size] = ImageFont.load_default()
+
+        image = Image.fromarray(
+            cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        )
+        draw = ImageDraw.Draw(image)
+        font = self.fonts[size]
+        x, y = position
+
+        if center:
+            box = draw.textbbox((0, 0), text, font=font)
+            x -= (box[2] - box[0]) / 2
+
+        draw.text(
+            (x, y), text, font=font, fill=tuple(reversed(color))
+        )
+        canvas[:] = cv2.cvtColor(
+            np.asarray(image), cv2.COLOR_RGB2BGR
+        )
+
+    def _paragraph(
+        self, canvas, text, position, width=18, size=20, color=DARK
+    ):
+        x, y = position
+        for i, line in enumerate(textwrap.wrap(text, width=width)):
+            self._text(
+                canvas, line, (x, y + i * (size + 5)),
+                size=size, color=color, center=True,
+            )
+
+    def _icon(self, canvas, filename, box, fallback):
+        x, y, width, height = box
+        filename = filename or ""
+
+        if filename not in self.icons:
+            path = ASSETS / filename
+            self.icons[filename] = (
+                cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                if filename and path.is_file()
+                else None
+            )
+
+        icon = self.icons[filename]
+        if icon is None:
+            cv2.rectangle(
+                canvas, (x, y), (x + width, y + height), TEAL, 2
+            )
+            self._text(
+                canvas, fallback, (x + width // 2, y + height // 2 - 9),
+                size=16, color=DARK, center=True,
+            )
+            return
+
+        if icon.ndim == 2:
+            icon = cv2.cvtColor(icon, cv2.COLOR_GRAY2BGR)
+
+        scale = min(width / icon.shape[1], height / icon.shape[0])
+        resized = cv2.resize(
+            icon,
+            (
+                max(1, round(icon.shape[1] * scale)),
+                max(1, round(icon.shape[0] * scale)),
+            ),
+        )
+        h, w = resized.shape[:2]
+        left = x + (width - w) // 2
+        top = y + (height - h) // 2
+        region = canvas[top:top + h, left:left + w]
+
+        if resized.shape[2] == 4:
+            alpha = resized[:, :, 3:4].astype(np.float32) / 255
+            region[:] = (
+                resized[:, :, :3] * alpha + region * (1 - alpha)
+            ).astype(np.uint8)
+        else:
+            region[:] = resized[:, :, :3]
+
+    def _base(self, title):
+        canvas = np.full((580, 1024, 3), 255, dtype=np.uint8)
+        cv2.rectangle(canvas, (0, 0), (1023, 75), DARK, -1)
+        self._text(canvas, title, (35, 23), size=26, color=WHITE)
+        self._text(canvas, "Pulse", (810, 20), size=31, color=WHITE)
+
+        ecg = np.array([
+            [905, 40], [925, 40], [931, 32], [938, 51],
+            [946, 13], [953, 64], [960, 28], [967, 40],
+            [974, 35], [980, 40], [1023, 40],
+        ], dtype=np.int32)
+        cv2.polylines(canvas, [ecg], False, WHITE, 2, cv2.LINE_AA)
+
+        self._text(canvas, "MOVA", (28, 548), size=21, color=INK)
+        return canvas
+
+    def _fit(self, frame, width, height):
+        h, w = frame.shape[:2]
+        scale = max(width / w, height / h)
+        resized = cv2.resize(
+            frame,
+            (
+                max(width, math.ceil(w * scale)),
+                max(height, math.ceil(h * scale)),
+            ),
+        )
+        x = (resized.shape[1] - width) // 2
+        y = (resized.shape[0] - height) // 2
+        return resized[y:y + height, x:x + width]
+
+    def _face_circle(self, canvas, frame, center, radius):
+        cx, cy = center
+        diameter = radius * 2
+        x, y = cx - radius, cy - radius
+
+        if frame is None:
+            cv2.circle(canvas, center, radius, LIGHT, -1)
+            self._text(
+                canvas, "Sin imagen", (cx, cy - 10),
+                size=20, color=DARK, center=True,
+            )
+        else:
+            crop = self._fit(frame, diameter, diameter)
+            mask = np.zeros((diameter, diameter), np.uint8)
+            cv2.circle(mask, (radius, radius), radius - 1, 255, -1)
+            region = canvas[y:y + diameter, x:x + diameter]
+            region[mask > 0] = crop[mask > 0]
+
+        cv2.circle(canvas, center, radius, TEAL, 3, cv2.LINE_AA)
+        self._draw_gaze(canvas, center, radius)
+
+    def _ring(self, canvas, center, radius, selected=None):
+        # Límites: -135, -45, 45, 135 y 225 grados.
+        # Equivalen a cortes en 45°, 135°, 225° y 315°.
+        for direction, start in zip(
+            DIRECTIONS, (-135, -45, 45, 135)
+        ):
+            color = DARK if direction == selected else LIGHT
+            cv2.ellipse(
+                canvas, center, (radius, radius),
+                0, start, start + 90, color, -1,
+            )
+
+        for angle in (45, 135, 225, 315):
+            radians = math.radians(angle)
+            point = (
+                round(center[0] + radius * math.cos(radians)),
+                round(center[1] + radius * math.sin(radians)),
+            )
+            cv2.line(canvas, center, point, TEAL, 3, cv2.LINE_AA)
+
+        cv2.circle(canvas, center, radius, TEAL, 3, cv2.LINE_AA)
+    def _draw_gaze(self, canvas, center, radius):
+        if self.gaze is None:
+            return
+
+        dx, dy = self.gaze
+        if not (math.isfinite(dx) and math.isfinite(dy)):
+            return
+
+        cx, cy = center
+        limit = radius * 0.80
+        threshold_x = self.config["threshold_x"]
+        threshold_y = self.config["threshold_y"]
+
+        # Misma escala para ambos ejes: conserva la dirección visual.
+        scale = limit / (1.5 * max(threshold_x, threshold_y))
+        px, py = dx * scale, dy * scale
+
+        # Mantener el punto dentro del círculo sin cambiar su dirección.
+        distance = math.hypot(px, py)
+        if distance > limit:
+            px *= limit / distance
+            py *= limit / distance
+
+        tip = (round(cx + px), round(cy + py))
+
+        centered = (
+            abs(dx) < self.config["release"]
+            and abs(dy) < self.config["release"]
+        )
+        color = (80, 230, 80) if centered else (0, 190, 255)
+
+        # Marcas de referencia de los umbrales de cada eje.
+        tx = round(threshold_x * scale)
+        ty = round(threshold_y * scale)
+
+        for x, y, horizontal in (
+            (cx - tx, cy, False),
+            (cx + tx, cy, False),
+            (cx, cy - ty, True),
+            (cx, cy + ty, True),
+        ):
+            p1 = (x - 4, y) if horizontal else (x, y - 4)
+            p2 = (x + 4, y) if horizontal else (x, y + 4)
+
+            cv2.line(canvas, p1, p2, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.line(canvas, p1, p2, WHITE, 2, cv2.LINE_AA)
+
+        # Radio móvil con contorno para contrastar sobre la cámara.
+        cv2.line(canvas, center, tip, (0, 0, 0), 5, cv2.LINE_AA)
+        cv2.line(canvas, center, tip, color, 2, cv2.LINE_AA)
+
+        # Centro fijo.
+        for stroke, thickness in (((0, 0, 0), 4), (WHITE, 2)):
+            cv2.drawMarker(
+                canvas,
+                center,
+                stroke,
+                cv2.MARKER_CROSS,
+                markerSize=14,
+                thickness=thickness,
+                line_type=cv2.LINE_AA,
+            )
+
+        # Posición actual de la cabeza.
+        cv2.circle(canvas, tip, 7, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(canvas, tip, 5, color, -1, cv2.LINE_AA)
+    def _render_menu(self, face):
+        canvas = self._base("Menú Principal")
+        center = (512, 325)
+        radius = 225
+
+        cv2.ellipse(
+            canvas, center, (radius, radius), 0, 180, 360, DARK, -1
+        )
+        cv2.ellipse(
+            canvas, center, (radius, radius), 0, 0, 180, LIGHT, -1
+        )
+        cv2.circle(canvas, center, radius, TEAL, 3, cv2.LINE_AA)
+
+        self._icon(
+            canvas, "steering.png", (465, 120, 94, 70), "Conducir"
+        )
+        self._icon(
+            canvas, "speaker.png", (465, 465, 94, 65), "Interactuar"
+        )
+        self._face_circle(canvas, face, center, 128)
+
+        if self.menu_progress > 0:
+            cv2.ellipse(
+                canvas, center, (radius + 5, radius + 5),
+                -90, 0, 360 * self.menu_progress,
+                TEAL, 7, cv2.LINE_AA,
+            )
+
+        cv2.rectangle(canvas, (18, 160), (230, 355), TEAL, -1)
+        cv2.fillPoly(
+            canvas,
+            [np.array([[48, 355], [48, 382], [80, 355]])],
+            TEAL,
+        )
+        seconds = f"{self.config['menu_hold']:g}"
+        self._paragraph(
+            canvas,
+            "Mueve tu cabeza hacia la opción que deseas "
+            f"y mantén {seconds} segundos",
+            (124, 178), width=17, size=20, color=WHITE,
+        )
+
+        self._icon(
+            canvas, "stem_udlap.png",
+            (855, 150, 130, 170), "STEM UDLAP",
+        )
+        cv2.rectangle(canvas, (850, 425), (1000, 525), LIGHT, -1)
+        self._icon(
+            canvas, "settings.png",
+            (870, 437, 110, 75), "Ajustes",
+        )
+
+        return canvas
+
+    def _render_drive(self, face, reversing, candidate):
+        canvas = self._base(
+            "Cámara trasera" if reversing else "Cámara delantera"
+        )
+        center = (265, 325)
+        radius = 195
+
+        selected = (
+            next(iter(self.keys), None) if self.keys else self.direction
+        )
+        self._ring(canvas, center, radius, selected or candidate)
+
+        vectors = ((0, -1), (1, 0), (0, 1), (-1, 0))
+        for direction, (dx, dy) in zip(DIRECTIONS, vectors):
+            start = (265 + dx * 123, 325 + dy * 123)
+            end = (265 + dx * 182, 325 + dy * 182)
+            color = WHITE if direction == selected else TEAL
+            cv2.arrowedLine(
+                canvas, start, end, color,
+                thickness=18, line_type=cv2.LINE_AA, tipLength=.48,
+            )
+
+        self._face_circle(canvas, face, center, 108)
+
+        x, y, width, height = 532, 76, 492, 468
+        cv2.rectangle(
+            canvas, (x, y), (x + width - 1, y + height - 1), LIGHT, -1
+        )
+
+        if reversing and self.rear is not None:
+            _, captured_at, rear_frame = self.rear.read()
+            if (
+                rear_frame is not None
+                and time.monotonic() - captured_at <= self.args.stale
+            ):
+                canvas[y:y + height, x:x + width] = self._fit(
+                    rear_frame, width, height
+                )
+            else:
+                self._text(
+                    canvas, "Esperando cámara trasera",
+                    (778, 290), size=22, center=True,
+                )
+        else:
+            self._paragraph(
+                canvas,
+                "La cámara trasera aparece al retroceder",
+                (778, 285), width=25, size=23,
+            )
+
+        return canvas
+
+    def _render_interact(self, face, candidate):
+        canvas = self._base(
+            f"Colección de interacciones {self.page_index + 1}"
+        )
+        center = (512, 325)
+
+        self._ring(canvas, center, 210, candidate)
+        self._face_circle(canvas, face, center, 105)
+
+        # Correspondencia exacta:
+        # arriba -> 0, derecha -> 1, abajo -> 2, izquierda -> 3.
+        positions = (
+            (512, 155), (835, 285), (512, 465), (185, 285)
+        )
+        commands = self.alexa.get_commands_for_page(self.page_index)
+
+        for command, (x, y) in zip(commands, positions):
+            if command is None:
+                self._text(
+                    canvas, "—", (x, y), size=24, center=True
+                )
+                continue
+
+            self._icon(
+                canvas, command["icon"],
+                (x - 20, y - 43, 40, 35), "Audio",
+            )
+            self._paragraph(
+                canvas, command["phrase"],
+                (x, y), width=22, size=19,
+            )
+
+        return canvas
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    parser = vision.parser()
+    args = parse_settings(parser, "mediapipe")
+
     root = tk.Tk()
-    Panel(root)
+    Panel(root, args)
     root.mainloop()
