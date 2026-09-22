@@ -55,8 +55,109 @@ class Camera(threading.Thread):
     def read(self):
         with self.lock:
             return self.snapshot
-
     def run(self):
+        cap = detector = None
+        try:
+            from gestures import mediapipe_gestures as m
+            a = m.parser().parse_args([])
+            a.models_dir = Path(__file__).resolve().parent / 'models'
+            self.publish({'status': 'Preparando modelo de cámara…'})
+            m.ensure_model(a.models_dir / 'face_landmarker.task')
+            detector = m.mp.tasks.vision.FaceLandmarker.create_from_options(
+                m.mp.tasks.vision.FaceLandmarkerOptions(
+                    base_options=m.mp.tasks.BaseOptions(model_asset_path=str(a.models_dir / 'face_landmarker.task')),
+                    running_mode=m.mp.tasks.vision.RunningMode.VIDEO, num_faces=1,
+                    min_face_detection_confidence=a.min_face_confidence,
+                    min_tracking_confidence=a.min_tracking_confidence))
+            cap = m.open_camera(0)
+            if not cap.isOpened():
+                raise RuntimeError('No se pudo abrir la cámara. Revisa los permisos de macOS.')
+            generation = 0
+            controller = m.GestureController(a, emit=lambda event: self.events.put((generation, event)) if event["type"] == "MOUTH_OPEN" else None)
+            # [smoothing] Filtro EMA compartido con mediapipe_gestures.
+            smoother = m.EMASmoother(a.smooth_alpha)
+            start, stamp = time.monotonic(), -1
+            while not self.quit.is_set():
+                try:
+                    while True:
+                        generation, settings = self.commands.get_nowait()
+                        for key, value in validate(settings).items():
+                            setattr(a, key, value)
+                        controller = m.GestureController(a, emit=lambda event: self.events.put((generation, event)) if event["type"] == "MOUTH_OPEN" else None)
+                        # [smoothing] Nueva generación: no arrastrar estado suavizado obsoleto.
+                        smoother.reset()
+                except queue.Empty:
+                    pass
+                ok, frame = cap.read()
+                now = time.monotonic()
+                if not ok:
+                    controller.fault('lectura_camara')
+                    # [smoothing]
+                    smoother.reset()
+                    self.publish({'status': 'No llegan imágenes de la cámara', 'generation': generation,
+                                  'at': now, 'direction': None})
+                    self.quit.wait(.05)
+                    continue
+                frame = m.cv2.flip(frame, 1)
+                h, w = frame.shape[:2]
+                if w > 640:
+                    frame = m.cv2.resize(frame, (640, round(h * 640 / w)))
+                h, w = frame.shape[:2]
+                rgb = m.cv2.cvtColor(frame, m.cv2.COLOR_BGR2RGB)
+                stamp = max(stamp + 1, int((now - start) * 1000))
+                result = detector.detect_for_video(m.mp.Image(image_format=m.mp.ImageFormat.SRGB, data=rgb), stamp)
+                dx = dy = db = blink = None
+                if result.face_landmarks:
+                    face = result.face_landmarks[0]
+                    pose = m.head_pose(face, w, h)
+                    if pose is None:
+                        controller.fault('rostro_no_confiable')
+                        # [smoothing]
+                        smoother.reset()
+                    else:
+                        # [smoothing] Suavizado EMA por señal, igual que en mediapipe_gestures.py.
+                        x = smoother.apply('x', pose[0])
+                        y = smoother.apply('y', pose[1])
+                        brow = smoother.apply('brow', m.brow_metric(face, w, h))
+                        blink = smoother.apply('blink', m.blink_metric(face, w, h))
+                        # La boca se lee cruda: es un evento discreto, no una señal continua.
+                        controller.feed(x, y, brow, blink, True, now, mouth=m.mouth_metric(face, w, h))
+                        if controller.baseline is not None:
+                            bx, by, bb = controller.baseline
+                            dx = (x - bx) * (-1 if a.invert_x else 1)
+                            dy = (y - by) * (-1 if a.invert_y else 1)
+                            db = brow - bb
+                    m.draw_landmarks(frame, face, w, h)
+                else:
+                    controller.fault('rostro_no_detectado')
+                    # [smoothing]
+                    smoother.reset()
+                if controller.last_fault:
+                    status = {'rostro_no_detectado': 'Rostro no detectado', 'ojos_cerrados': 'Ojos cerrados: vuelve al centro'}.get(controller.last_fault, 'Seguimiento no confiable')
+                elif controller.baseline is None:
+                    status = 'Calibrando: mira al centro con cejas relajadas'
+                elif controller.candidate == 'BOCA':
+                    status = 'Sostén la apertura' if controller.mouth_ready else 'Boca registrada o bloqueada: ciérrala para rearmar'
+                elif controller.active:
+                    status = 'Gesto confirmado: ' + controller.active.lower()
+                elif controller.armed:
+                    status = 'Listo: dirección, cejas o apertura de boca'
+                else:
+                    status = 'Vuelve al centro para habilitar el siguiente gesto'
+                required = a.mouth_hold if controller.candidate == 'BOCA' else a.center_hold if controller.candidate == 'CENTRO' else a.mode_hold if controller.candidate == 'MODO' else a.hold
+                progress = min(100, max(0, (now - controller.since) / required * 100)) if controller.candidate not in (None, 'AMBIGUO') else 0
+                m.draw_hud(frame, controller, a, dx, dy, db, blink, now, w, h)
+                self.publish(dict(status=status, generation=generation, at=now, direction=controller.active,
+                                  mode=controller.mode, progress=progress,
+                                  image=m.cv2.cvtColor(frame, m.cv2.COLOR_BGR2RGB)))
+        except Exception as exc:
+            self.publish({'status': f'Cámara: {type(exc).__name__}: {exc}', 'error': True})
+        finally:
+            if cap is not None:
+                cap.release()
+            if detector is not None:
+                detector.close()
+  
         cap = detector = None
         try:
             from gestures import mediapipe_gestures as m

@@ -2,14 +2,16 @@
 """Puente MediaPipe (Face Landmarker) -> GestureController de openface.py.
 
 Python 3.9+; requiere: opencv-python, mediapipe, numpy.
-Ejemplo:
-  python mediapipe_gestures.py --preview --debug --invert-x
 
-stdout: mismos eventos JSONL que openface.py (STOP/MOVE/INTERACT/MODE/
+Ejemplo:
+    python mediapipe_gestures.py --preview --debug --invert-x
+
+stdout: mismos eventos JSONL que openface.py (STOP/MOVE/INTERACT/MODE/...)
 
 Documentación:
-https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker
+    https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker
 """
+
 import argparse
 import math
 import os
@@ -22,6 +24,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import mediapipe as mp
+
 
 def _locate_openface():
     """Busca openface.py junto a este script o en subcarpetas comunes,
@@ -46,8 +49,7 @@ if os.environ.get('OPENFACE_DIR'):
 else:
     _locate_openface()
 
-from openface import GestureController, log  # noqa: E402  (misma máquina de estados)
-
+from openface import GestureController, log  # noqa: E402 (misma máquina de estados)
 
 try:
     from .config import add_config_arguments, parse_settings
@@ -66,22 +68,28 @@ RIGHT_EYE_EAR = [33, 160, 158, 133, 144, 153]
 LEFT_BROW, LEFT_EYE_TOP = 105, 159
 RIGHT_BROW, RIGHT_EYE_TOP = 334, 386
 LEFT_EYE_OUTER, RIGHT_EYE_OUTER = 33, 263
-NOSE_TIP, CHIN, MOUTH_L, MOUTH_R = 1, 152, 61, 291
-POSE_LANDMARKS = [NOSE_TIP, CHIN, LEFT_EYE_OUTER, RIGHT_EYE_OUTER, MOUTH_L, MOUTH_R]
+NOSE_TIP, NASION, LEFT_TEMPLE, RIGHT_TEMPLE, MOUTH_L, MOUTH_R = 1, 168, 127, 356, 61, 291
+# MOUTH_L/MOUTH_R se conservan solo para mouth_metric(); ya no entran en head_pose().
 
-# Modelo 3D canónico (mm) para solvePnP — set estándar de 6 puntos.
+POSE_LANDMARKS = [NOSE_TIP, NASION, LEFT_EYE_OUTER, RIGHT_EYE_OUTER, LEFT_TEMPLE, RIGHT_TEMPLE]
+# Puntos rígidos frente a la articulación mandibular: nariz, nasión, esquinas
+# oculares externas y sienes. Se retiraron mentón y comisuras de boca del set
+# de pose porque solvePnP los trataba como geometría rígida y atribuía la
+# apertura de mandíbula a un falso cambio de pitch.
+
+# Modelo 3D canónico (mm) para solvePnP — 6 puntos, ninguno afectado por la mandíbula.
 MODEL_POINTS_3D = np.array([
-    (0.0, 0.0, 0.0),          # nariz
-    (0.0, -330.0, -65.0),     # mentón
+    (0.0, 0.0, 0.0),          # punta de nariz
+    (0.0, 45.0, -30.0),       # nasión (entre las cejas)
     (-225.0, 170.0, -135.0),  # esquina externa ojo (visualmente izquierda)
     (225.0, 170.0, -135.0),   # esquina externa ojo (visualmente derecha)
-    (-150.0, -150.0, -125.0),  # comisura izquierda boca
-    (150.0, -150.0, -125.0),   # comisura derecha boca
+    (-320.0, 90.0, -270.0),   # sien/pómulo izquierdo
+    (320.0, 90.0, -270.0),    # sien/pómulo derecho
 ], dtype=np.float64)
 
-EAR_OPEN_BASELINE = 0.30   # EAR típico ojo abierto; ajusta si tu cámara/ángulo difiere
-BLINK_SCALE = 12.0         # heurístico: mapea (baseline - EAR) a una escala tipo AU
-BROW_SCALE = 20.0          # heurístico: mapea distancia ceja/ojo normalizada a escala tipo AU
+EAR_OPEN_BASELINE = 0.30  # EAR típico ojo abierto; ajusta si tu cámara/ángulo difiere
+BLINK_SCALE = 12.0  # heurístico: mapea (baseline - EAR) a una escala tipo AU
+BROW_SCALE = 20.0  # heurístico: mapea distancia ceja/ojo normalizada a escala tipo AU
 
 _camera_matrix_cache = {}
 
@@ -103,7 +111,12 @@ def camera_matrix(w, h):
 
 
 def head_pose(landmarks, w, h):
-    """Devuelve (yaw_rad, pitch_rad) vía solvePnP, o None si falla."""
+    """Devuelve (yaw_rad, pitch_rad) vía solvePnP, o None si falla.
+
+    Usa seis puntos rígidos (nariz, nasión, esquinas oculares externas y
+    sienes); ninguno se desplaza al abrir la mandíbula, así que abrir la
+    boca ya no se filtra como una falsa inclinación de cabeza.
+    """
     image_points = np.array(
         [(landmarks[i].x * w, landmarks[i].y * h) for i in POSE_LANDMARKS],
         dtype=np.float64)
@@ -154,9 +167,50 @@ def brow_metric(landmarks, w, h):
 
     def side(brow_idx, eye_idx):
         return max(0.0, (landmarks[eye_idx].y * h - landmarks[brow_idx].y * h) / interocular)
-
     raised = (side(LEFT_BROW, LEFT_EYE_TOP) + side(RIGHT_BROW, RIGHT_EYE_TOP)) / 2
     return raised * BROW_SCALE
+
+
+class EMASmoother:
+    """Filtro paso-bajo de un polo (media móvil exponencial) por señal.
+
+    smoothed[t] = alpha * raw[t] + (1 - alpha) * smoothed[t-1]
+
+    Por qué funciona: cuadro a cuadro, el ruido de detección de landmarks
+    (temblor de +-1 px, iluminación, compresión de la cámara) cambia mucho
+    más rápido que el movimiento real de cabeza o cejas, que está limitado
+    por la inercia del cuello y los músculos faciales. Ponderar cada nueva
+    lectura contra el valor suavizado anterior es, matemáticamente, un
+    filtro IIR de un polo: atenúa las componentes de alta frecuencia (el
+    temblor) y deja pasar las de baja frecuencia (el gesto real), al precio
+    de un pequeño retardo de fase. `alpha` controla el compromiso: más bajo
+    = más suavizado pero más retardo; `alpha=1.0` equivale a no suavizar.
+    """
+
+    def __init__(self, alpha):
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError('smooth-alpha debe estar en (0, 1]')
+        self.alpha = alpha
+        self._state = {}
+
+    def reset(self, key=None):
+        """Olvida el estado (todo, o solo `key`). Llamar tras perder la cara
+        para no arrastrar un valor suavizado obsoleto al recuperar seguimiento."""
+        if key is None:
+            self._state.clear()
+        else:
+            self._state.pop(key, None)
+
+    def apply(self, key, value):
+        if value is None or not math.isfinite(value):
+            return value
+        prev = self._state.get(key)
+        if prev is None:
+            self._state[key] = value
+            return value
+        smoothed = self.alpha * value + (1.0 - self.alpha) * prev
+        self._state[key] = smoothed
+        return smoothed
 
 
 def ensure_model(path: Path):
@@ -186,14 +240,14 @@ def draw_landmarks(image, landmarks, w, h):
 
 def _dot_color(controller):
     if controller.active is not None:
-        return (0, 140, 255)       # naranja: gesto MOVIMIENTO activo/sostenido
+        return (0, 140, 255)  # naranja: gesto MOVIMIENTO activo/sostenido
     if controller.candidate == 'MODO':
-        return (60, 60, 255)       # rojo: cejas levantadas, candidato a cambio de modo
+        return (60, 60, 255)  # rojo: cejas levantadas, candidato a cambio de modo
     if controller.candidate == 'CENTRO':
         return (0, 255, 0) if controller.armed else (0, 255, 255)  # verde=armado, amarillo=sosteniendo
     if controller.candidate in ('IZQUIERDA', 'DERECHA', 'ATRAS', 'ADELANTE'):
         return (255, 200, 0) if controller.armed else (130, 130, 130)  # gris = bloqueado, falta CENTRO
-    return (170, 170, 170)         # AMBIGUO / sin candidato
+    return (170, 170, 170)  # AMBIGUO / sin candidato
 
 
 def _draw_gauge(image, x, y, w_px, label, value, threshold, max_value, unit=''):
@@ -205,9 +259,9 @@ def _draw_gauge(image, x, y, w_px, label, value, threshold, max_value, unit=''):
         over = value >= threshold
         color = (0, 0, 255) if over else (0, 200, 0)
         cv2.rectangle(image, (x, y), (x + fill_w, y + h_px), color, -1)
-    if max_value > 0:
-        tick_x = x + int(w_px * max(0.0, min(1.0, threshold / max_value)))
-        cv2.line(image, (tick_x, y - 2), (tick_x, y + h_px + 2), (255, 255, 255), 1)
+        if max_value > 0:
+            tick_x = x + int(w_px * max(0.0, min(1.0, threshold / max_value)))
+            cv2.line(image, (tick_x, y - 2), (tick_x, y + h_px + 2), (255, 255, 255), 1)
     cv2.putText(image, label, (x, y - 4), FONT, 0.4, (255, 255, 255), 1)
 
 
@@ -242,14 +296,12 @@ def draw_hud(image, controller, a, disp_x, disp_y, disp_brow, blink_raw, now, w,
     rx = int(a.threshold_x * scale)
     ry = int(a.threshold_y * scale)
     r_threshold = max(rx, ry)
-
-    cv2.rectangle(image, (cx-r_release, cy-r_release), (cx+r_release, cy+r_release), (90, 90, 90), 1)
-    cv2.line(image, (cx+rx, cy-ry), (cx+rx, cy+ry), (100, 100, 100), 1)
-    cv2.line(image, (cx-rx, cy-ry), (cx-rx, cy+ry), (100, 100, 100), 1)
-    cv2.line(image, (cx-rx, cy-ry), (cx+rx, cy-ry), (100, 100, 100), 1)
-    cv2.line(image, (cx-rx, cy+ry), (cx+rx, cy+ry), (100, 100, 100), 1)
+    cv2.rectangle(image, (cx - r_release, cy - r_release), (cx + r_release, cy + r_release), (90, 90, 90), 1)
+    cv2.line(image, (cx + rx, cy - ry), (cx + rx, cy + ry), (100, 100, 100), 1)
+    cv2.line(image, (cx - rx, cy - ry), (cx - rx, cy + ry), (100, 100, 100), 1)
+    cv2.line(image, (cx - rx, cy - ry), (cx + rx, cy - ry), (100, 100, 100), 1)
+    cv2.line(image, (cx - rx, cy + ry), (cx + rx, cy + ry), (100, 100, 100), 1)
     cv2.drawMarker(image, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 16, 1)
-
     labels = {
         'DERECHA': (cx + r_threshold + 8, cy + 5),
         'IZQUIERDA': (cx - r_threshold - 95, cy + 5),
@@ -258,7 +310,6 @@ def draw_hud(image, controller, a, disp_x, disp_y, disp_brow, blink_raw, now, w,
     }
     for text, pos in labels.items():
         cv2.putText(image, text, pos, FONT, 0.45, (150, 150, 150), 1)
-
     if disp_x is None:
         cv2.putText(image, 'CALIBRANDO...', (cx - 70, cy - r_threshold - 30),
                     FONT, 0.6, (0, 255, 255), 2)
@@ -268,13 +319,11 @@ def draw_hud(image, controller, a, disp_x, disp_y, disp_brow, blink_raw, now, w,
         color = _dot_color(controller)
         cv2.line(image, (cx, cy), (px, py), color, 1)
         cv2.circle(image, (px, py), 9, color, -1)
-
     _draw_gauge(image, 10, h - 55, 150, 'CEJAS', disp_brow, a.brow, a.brow * 2)
     _draw_gauge(image, 10, h - 25, 150, 'OJOS', blink_raw, a.blink, a.blink * 2)
     _draw_gauge(image, 10, h - 85, 150, 'BOCA', controller.mouth_raw, a.mouth_open, a.mouth_open * 2)
     _draw_hold_bar(image, controller, a, now, w, h)
-
-    status = f'modo={controller.mode}  activo={controller.active}  candidato={controller.candidate}'
+    status = f'modo={controller.mode} activo={controller.active} candidato={controller.candidate}'
     cv2.putText(image, status, (10, 20), FONT, 0.5, (0, 255, 0), 1)
 
 
@@ -298,8 +347,26 @@ def parser():
     p.add_argument('--calibration', type=float, default=2.0)
     p.add_argument('--stale', type=float, default=.5, help='timeout de datos, segundos')
     p.add_argument('--startup-timeout', type=float, default=15)
+    p.add_argument('--smooth-alpha', type=float, default=.35,
+                    help='suavizado EMA de yaw/pitch/cejas/parpadeo, en (0,1]; 1.0 = sin suavizar')
+    p.add_argument('--gpu', action='store_true',
+                    help='usa el delegado GPU de MediaPipe (OpenGL ES vía EGL); si falla, cae a CPU automáticamente')
     add_config_arguments(p, 'mediapipe')
     return p
+
+
+def _create_face_landmarker(model_path, a, delegate):
+    BaseOptions = mp.tasks.BaseOptions
+    FaceLandmarker = mp.tasks.vision.FaceLandmarker
+    FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+    RunningMode = mp.tasks.vision.RunningMode
+    return FaceLandmarker.create_from_options(FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(model_path), delegate=delegate),
+        running_mode=RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=a.min_face_confidence,
+        min_tracking_confidence=a.min_tracking_confidence,
+    ))
 
 
 def main():
@@ -309,23 +376,25 @@ def main():
                  'center_hold', 'calibration', 'stale', 'startup_timeout')
     if any(not math.isfinite(getattr(a, k)) or getattr(a, k) <= 0 for k in positives):
         p.error('Los umbrales y tiempos deben ser positivos y finitos.')
+    if not (0.0 < a.smooth_alpha <= 1.0):
+        p.error('--smooth-alpha debe estar en (0, 1].')
 
     model_path = a.models_dir.expanduser().resolve() / 'face_landmarker.task'
     ensure_model(model_path)
 
     BaseOptions = mp.tasks.BaseOptions
-    FaceLandmarker = mp.tasks.vision.FaceLandmarker
-    FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
-    RunningMode = mp.tasks.vision.RunningMode
-    face_landmarker = FaceLandmarker.create_from_options(FaceLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(model_path)),
-        running_mode=RunningMode.VIDEO,
-        num_faces=1,
-        min_face_detection_confidence=a.min_face_confidence,
-        min_tracking_confidence=a.min_tracking_confidence,
-    ))
+    delegate = BaseOptions.Delegate.GPU if a.gpu else BaseOptions.Delegate.CPU
+    try:
+        face_landmarker = _create_face_landmarker(model_path, a, delegate)
+    except Exception as exc:
+        if a.gpu:
+            log(f'[System] Delegado GPU no disponible ({exc}); usando CPU.')
+            face_landmarker = _create_face_landmarker(model_path, a, BaseOptions.Delegate.CPU)
+        else:
+            raise
 
     controller = GestureController(a)
+    smoother = EMASmoother(a.smooth_alpha)
     cap = open_camera(a.device)
     if not cap.isOpened():
         log('[Critical Error] No se pudo abrir la cámara.')
@@ -338,14 +407,15 @@ def main():
 
     start_mono = time.monotonic()
     last_ts_ms = -1
-
     try:
         while True:
             success, frame = cap.read()
             if not success:
                 controller.fault('lectura_camara')
+                smoother.reset()
                 time.sleep(.02)
                 continue
+
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -364,12 +434,16 @@ def main():
                 pose = head_pose(landmarks, w, h)
                 if pose is None:
                     controller.fault('rostro_no_confiable')
+                    smoother.reset()
                     yaw = pitch = brow = blink = None
                 else:
-                    yaw, pitch = pose
-                    brow = brow_metric(landmarks, w, h)
-                    blink = blink_metric(landmarks, w, h)
-                    controller.feed(yaw, pitch, brow, blink, True, now, mouth=mouth_metric(landmarks, w, h))
+                    yaw_raw, pitch_raw = pose
+                    yaw = smoother.apply('yaw', yaw_raw)
+                    pitch = smoother.apply('pitch', pitch_raw)
+                    brow = smoother.apply('brow', brow_metric(landmarks, w, h))
+                    blink = smoother.apply('blink', blink_metric(landmarks, w, h))
+                controller.feed(yaw, pitch, brow, blink, True, now, mouth=mouth_metric(landmarks, w, h))
+
                 if a.preview:
                     draw_landmarks(frame, landmarks, w, h)
                     if controller.baseline is not None and yaw is not None:
@@ -382,6 +456,7 @@ def main():
                     draw_hud(frame, controller, a, disp_x, disp_y, disp_brow, blink, now, w, h)
             else:
                 controller.fault('rostro_no_detectado')
+                smoother.reset()
 
             if a.preview:
                 cv2.imshow('mediapipe_gestures', frame)
