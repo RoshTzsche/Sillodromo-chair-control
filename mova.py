@@ -359,10 +359,17 @@ class Panel:
         self.alexa = AlexaDispatcher(self.config)
 
         root.title("MOVA · Pulse")
-        root.resizable(False, False)
-
-        self.video = tk.Label(root, borderwidth=0)
-        self.video.pack()
+        root.resizable(True, True)
+        root.attributes("-fullscreen", True)
+        root.bind("<F11>", lambda event: root.attributes(
+        "-fullscreen", not root.attributes("-fullscreen")
+        ))
+        self.video = tk.Label(
+            root, borderwidth=0, highlightthickness=0,
+            background="white", anchor="center",
+            width=1, height=1,
+        )
+        self.video.pack(fill="both", expand=True)
         self.video.bind("<Button-1>", self._image_click)
 
         self.manual_controls = ttk.Frame(root, padding=6)
@@ -666,9 +673,22 @@ class Panel:
         footer = f"{self.arduino_output.status()} · {status}"
         self._text(canvas, footer[:110], (185, 557), size=13)
 
-        self.photo = ImageTk.PhotoImage(
-            Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
-        )
+        image = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+
+        available_w = max(1, self.video.winfo_width())
+        available_h = max(1, self.video.winfo_height())
+        scale = min(available_w / image.width, available_h / image.height)
+
+        width = max(1, round(image.width * scale))
+        height = max(1, round(image.height * scale))
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+
+        self.view_scale_x = width / canvas.shape[1]
+        self.view_scale_y = height / canvas.shape[0]
+        self.view_offset_x = (available_w - width) // 2
+        self.view_offset_y = (available_h - height) // 2
+
+        self.photo = ImageTk.PhotoImage(image)
         self.video.configure(image=self.photo)
         self.root.after(40, self.refresh)
 
@@ -732,7 +752,13 @@ class Panel:
         self.keys = {KEYS[k] for k in held if k in KEYS}
 
     def _image_click(self, event):
-        x, y = event.x, event.y
+        x = (
+            event.x - getattr(self, "view_offset_x", 0)
+        ) / getattr(self, "view_scale_x", 1)
+
+        y = (
+            event.y - getattr(self, "view_offset_y", 0)
+        ) / getattr(self, "view_scale_y", 1)
 
         if self.state == "MENU" and 850 <= x <= 1000 and 425 <= y <= 525:
             self.change_state("SETTINGS")
