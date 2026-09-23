@@ -17,8 +17,8 @@
       "mouth_close": 0.2,
       "mouth_hold": 0.45,
       "mouth_close_hold": 0.2,
-      "invert_x": false,
-      "invert_y": false,
+      "invert_x": true,
+      "invert_y": true,
       "menu_hold": 3.0,
       "interact_page_hold": 1.2,
       "cam_front_index": 0,
@@ -48,7 +48,7 @@
           "phrase": "Alexa, apaga el foco",
           "icon": "switch.png"
         },
-         {
+        {
           "audio": "audio/Secadora on.m4a.mp4",
           "wake_audio": "audio/Alexa.m4a.mp4",
           "rate": 175,
@@ -72,7 +72,7 @@
           "phrase": "Alexa, apaga Secadora",
           "icon": "switch.png"
         },
-         {
+        {
           "audio": "audio/Youtube.m4a.mp4",
           "wake_audio": "audio/Alexa.m4a.mp4",
           "rate": 175,
@@ -132,7 +132,6 @@
           "phrase": "Alexa, apaga Rasuradora",
           "icon": "switch.png"
         },
-       
         {
           "audio": "audio/Venti on.m4a.mp4",
           "wake_audio": "audio/Alexa.m4a.mp4",
@@ -169,7 +168,6 @@
           "phrase": "Alexa, abre Netflix",
           "icon": "netflix.png"
         },
-       
         {
           "audio": "audio/Prime.m4a.mp4",
           "wake_audio": "audio/Alexa.m4a.mp4",

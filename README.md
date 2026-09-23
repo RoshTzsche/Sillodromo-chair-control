@@ -39,7 +39,21 @@ La visión procesa únicamente la cámara frontal. La cámara trasera aporta una
 | Boca | Apertura entre labios dividida entre anchura de boca | Solicitar parada y regresar al menú |
 
 Las direcciones proceden del giro horizontal (*yaw*) y vertical (*pitch*) de la cabeza. **No se rastrea la mirada de las pupilas.** La calibración aprende el centro del usuario, pero no entrena un modelo nuevo ni ajusta automáticamente los umbrales.
+## Interfaz y modos de uso
 
+### Menú principal
+
+![Menú principal de MOVA](gitimages/main.png)
+
+### Modo de interacción
+
+![Modo de interacción de MOVA](gitimages/interacciones.png)
+
+### Modo de movimiento
+
+![Vista del modo de movimiento](gitimages/movement.png)
+
+![Segunda vista del modo de movimiento](gitimages/rearmovement.png)
 ## Uso de la interfaz
 
 | Pantalla o gesto | Comportamiento |
