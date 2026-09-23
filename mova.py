@@ -1334,7 +1334,7 @@ class Panel:
 
         return canvas
 
-
+#holapotaxies, hola no
 if __name__ == "__main__":
     parser = vision.parser()
     args = parse_settings(parser, "mediapipe")
