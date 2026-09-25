@@ -1,3 +1,5 @@
+#4to. Concurso estudiantil para generación de aplicaciones biomédicas a partir del procesamiento y análisis de bioseñales
+#Rosh Guadiana, Gabriel Velázquez y Lourdes García
 import copy
 import math
 import queue
